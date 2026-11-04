@@ -1,0 +1,61 @@
+[package]
+name = "mome"
+version = "0.1.2"
+edition = "2021"
+description = "mome - a lightweight text editor for Windows 11"
+build = "build.rs"
+
+[dependencies]
+eframe = "0.36.2"
+egui = "0.36.2"
+rfd = "0.17.2"
+arboard = { version = "3.6", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+raw-window-handle = "0.6"
+# Same version and features as egui's text engine; used to read vertical font metrics.
+skrifa = { version = "0.44", default-features = false, features = ["std", "autohint_shaping"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Text layout is slow in unoptimized builds, so optimize dependencies even for
+# `cargo run` while keeping our own crate debuggable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[package.metadata.winresource]
+ProductName = "mome"
+FileDescription = "mome Text Editor"
