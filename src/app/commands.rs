@@ -6,6 +6,7 @@ use egui::{Event, Key, KeyboardShortcut, Modifiers};
 
 use super::dialogs::{Dialog, FontPicker, GoToForm, HistoryBrowser, SettingsForm};
 use super::findbar::Direction;
+use super::viewer::ViewKind;
 use super::{After, MomeApp};
 use crate::encoding::{Encoding, LineEnding};
 use crate::history::RevisionKind;
@@ -52,6 +53,7 @@ pub enum Cmd {
     ToggleWrap,
     Font,
     FormatJson,
+    ToggleReader,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -84,6 +86,7 @@ const SHORTCUTS: &[(Modifiers, Key, Cmd)] = &[
     (Modifiers::NONE, Key::F3, Cmd::FindNext),
     (CMD, Key::H, Cmd::Replace),
     (CMD, Key::G, Cmd::GoTo),
+    (CMD, Key::E, Cmd::ToggleReader),
     (Modifiers::NONE, Key::F5, Cmd::TimeDate),
     (CMD, Key::Plus, Cmd::ZoomIn),
     (CMD, Key::Equals, Cmd::ZoomIn),
@@ -105,6 +108,7 @@ pub(super) const SHORTCUT_HELP: &[(&str, &str)] = &[
     ("Ctrl+F / Ctrl+H", "찾기 / 바꾸기"),
     ("F3 / Shift+F3", "다음 찾기 / 이전 찾기"),
     ("Ctrl+G", "줄로 이동"),
+    ("Ctrl+E", "읽기 모드 / 편집 모드 전환 (Markdown·캔버스)"),
     ("F5", "시간/날짜 삽입"),
     ("Insert", "삽입 / 겹쳐쓰기 전환"),
     ("Ctrl+더하기 / 빼기 / 0", "확대 / 축소 / 기본 크기로 복원"),
@@ -134,6 +138,7 @@ pub fn shortcut_text(cmd: &Cmd) -> &'static str {
         Cmd::FindPrev => "Shift+F3",
         Cmd::Replace => "Ctrl+H",
         Cmd::GoTo => "Ctrl+G",
+        Cmd::ToggleReader => "Ctrl+E",
         Cmd::SelectAll => "Ctrl+A",
         Cmd::TimeDate => "F5",
         Cmd::ToggleOverwrite => "Insert",
@@ -163,8 +168,8 @@ impl MomeApp {
             self.find.close();
             self.editor.request_focus();
         }
-        // Ctrl + mouse wheel zooms the text.
-        let zoom = ctx.input(|i| i.zoom_delta());
+        // Ctrl + mouse wheel zooms the text (the canvas zooms itself).
+        let zoom = if self.reading() == Some(ViewKind::Canvas) { 1.0 } else { ctx.input(|i| i.zoom_delta()) };
         if zoom > 1.0 {
             self.editor.zoom_by(1);
         } else if zoom < 1.0 {
@@ -173,6 +178,36 @@ impl MomeApp {
     }
 
     pub(super) fn run(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame, cmd: Cmd) {
+        if let Some(kind) = self.reading() {
+            match cmd {
+                // Overwrite mode means nothing while reading.
+                Cmd::ToggleOverwrite => return,
+                Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset if kind == ViewKind::Canvas => {
+                    match cmd {
+                        Cmd::ZoomIn => self.viewer.zoom_canvas(1.25),
+                        Cmd::ZoomOut => self.viewer.zoom_canvas(1.0 / 1.25),
+                        _ => self.viewer.fit_canvas(),
+                    }
+                    return;
+                }
+                // Commands that work on the text go back to the editor first.
+                Cmd::Undo
+                | Cmd::Redo
+                | Cmd::Cut
+                | Cmd::Copy
+                | Cmd::Paste
+                | Cmd::Delete
+                | Cmd::Find
+                | Cmd::Replace
+                | Cmd::FindNext
+                | Cmd::FindPrev
+                | Cmd::GoTo
+                | Cmd::SelectAll
+                | Cmd::TimeDate
+                | Cmd::FormatJson => self.set_reading(false),
+                _ => {}
+            }
+        }
         match cmd {
             Cmd::New => self.confirm_then(ctx, frame, After::New),
             Cmd::NewWindow => win::spawn_self(&[]),
@@ -273,6 +308,14 @@ impl MomeApp {
                 self.open_dialog(Dialog::Font(Box::new(picker)));
             }
             Cmd::FormatJson => self.format_json(ctx),
+            Cmd::ToggleReader => {
+                if self.view_kind().is_some() {
+                    let on = !self.viewer.on;
+                    self.set_reading(on);
+                } else {
+                    self.notify("읽기 모드는 Markdown(.md)과 옵시디언 캔버스(.canvas) 파일에서 쓸 수 있습니다.".to_owned());
+                }
+            }
             Cmd::ZoomIn => self.editor.zoom_by(1),
             Cmd::ZoomOut => self.editor.zoom_by(-1),
             Cmd::ZoomReset => self.editor.zoom = 100,

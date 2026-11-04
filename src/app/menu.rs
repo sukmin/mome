@@ -1,4 +1,4 @@
-//! Menu bar, plus the dark-mode and JSON 정리 buttons in the top-right corner.
+//! Menu bar, plus the dark-mode, 읽기/편집 and JSON 정리 buttons in the top-right corner.
 
 use egui::{Align, Button, Color32, Frame, Layout, Margin, RichText, Sense, Ui, Vec2};
 
@@ -24,7 +24,10 @@ impl MomeApp {
                     ui.menu_button("도움말", |ui| self.help_menu(ui));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         self.theme_toggle(ui);
-                        if self.is_json() {
+                        if self.view_kind().is_some() {
+                            self.reader_switch(ui);
+                        }
+                        if self.is_json() && self.reading().is_none() {
                             self.json_button(ui);
                         }
                     });
@@ -164,6 +167,15 @@ impl MomeApp {
             self.item(ui, "축소", Cmd::ZoomOut, true);
             self.item(ui, "기본 크기로 복원", Cmd::ZoomReset, true);
         });
+        let reading = self.reading().is_some();
+        let label = "읽기 모드 (Markdown·캔버스)";
+        let shortcut = shortcut_text(&Cmd::ToggleReader);
+        let mark = if reading { ui.visuals().text_color() } else { Color32::TRANSPARENT };
+        let button = Button::new((RichText::new("✔").color(mark), label)).shortcut_text(shortcut);
+        if ui.add_enabled(self.view_kind().is_some(), button).clicked() {
+            self.pending_cmds.push(Cmd::ToggleReader);
+            ui.close();
+        }
         let status = self.settings.show_status_bar;
         self.check_item(ui, "상태 표시줄", status, Cmd::ToggleStatusBar);
         let dark = self.settings.dark_mode;
@@ -218,7 +230,9 @@ impl MomeApp {
     /// Whether 서식 > JSON 정리 applies: a .json file, or untitled text that starts like JSON.
     fn is_json(&self) -> bool {
         match &self.doc.path {
-            Some(path) => path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")),
+            Some(path) => path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("canvas")),
             None => self.doc.text.trim_start().starts_with(['{', '[']),
         }
     }
@@ -228,6 +242,19 @@ impl MomeApp {
         let tip = "JSON을 들여쓰기해 보기 좋게 정리합니다. 키 순서와 값은 그대로 두며, Ctrl+Z로 되돌릴 수 있습니다.";
         if ui.button("{ } JSON 정리").on_hover_text(tip).clicked() {
             self.pending_cmds.push(Cmd::FormatJson);
+        }
+    }
+
+    /// "편집 | 읽기": which view of a Markdown or canvas file is showing.
+    fn reader_switch(&mut self, ui: &mut Ui) {
+        let reading = self.reading().is_some();
+        // Right-to-left layout: the last one added is on the left.
+        let read = ui
+            .selectable_label(reading, "읽기")
+            .on_hover_text("서식을 입혀 보여 줍니다. 링크를 누르면 그 노트를 엽니다. (Ctrl+E)");
+        let edit = ui.selectable_label(!reading, "편집").on_hover_text("글을 고칩니다. (Ctrl+E)");
+        if (read.clicked() && !reading) || (edit.clicked() && reading) {
+            self.pending_cmds.push(Cmd::ToggleReader);
         }
     }
 

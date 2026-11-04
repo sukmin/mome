@@ -7,6 +7,7 @@ mod findbar;
 mod menu;
 mod recovery;
 mod status;
+mod viewer;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,7 @@ use dialogs::{Dialog, SettingsForm};
 use editor::Editor;
 use findbar::FindBar;
 use recovery::doc_from_revision;
+use viewer::{ViewKind, Viewer};
 
 /// How the process was started.
 #[derive(Default)]
@@ -86,6 +88,8 @@ pub struct MomeApp {
     stats: TextStats,
     editor: Editor,
     find: FindBar,
+    /// 읽기 모드 (Markdown and canvas reader).
+    viewer: Viewer,
     dialog: Option<Dialog>,
     /// Dialogs waiting for the open one to close.
     dialog_queue: VecDeque<Dialog>,
@@ -130,6 +134,10 @@ impl MomeApp {
         theme::install(ctx);
         theme::apply(ctx, settings.dark_mode);
 
+        // Images in Markdown and canvases; ours goes last so it is asked first.
+        egui_extras::install_image_loaders(ctx);
+        ctx.add_bytes_loader(std::sync::Arc::new(crate::markdown::LocalFileLoader::default()));
+
         let mut fonts = FontStore::default();
         ctx.set_fonts(fonts.definitions(&settings.font, None));
 
@@ -154,6 +162,7 @@ impl MomeApp {
             stats: TextStats::default(),
             editor: Editor::new(),
             find: FindBar::default(),
+            viewer: Viewer::default(),
             dialog: None,
             dialog_queue: VecDeque::new(),
             pending_cmds: Vec::new(),
@@ -227,6 +236,9 @@ impl MomeApp {
                     "About" => Cmd::About,
                     "ToggleDark" => Cmd::ToggleDark,
                     "FormatJson" => Cmd::FormatJson,
+                    "ToggleReader" => Cmd::ToggleReader,
+                    "ZoomIn" => Cmd::ZoomIn,
+                    "ZoomOut" => Cmd::ZoomOut,
                     _ => continue,
                 };
                 self.pending_cmds.push(cmd);
@@ -249,6 +261,14 @@ impl MomeApp {
     /// Makes `doc` the open document.
     fn set_document(&mut self, ctx: &egui::Context, doc: Document, cursor: usize) {
         self.doc = doc;
+        // Canvases open in the reader; Markdown keeps the mode of the last note.
+        let reading = match ViewKind::of(self.doc.path.as_deref()) {
+            Some(ViewKind::Canvas) => true,
+            Some(ViewKind::Markdown) => self.viewer.on,
+            None => false,
+        };
+        self.viewer.reset();
+        self.viewer.on = reading;
         self.stats = TextStats::compute(&self.doc.text);
         self.text_version += 1;
         self.snapshot = SnapshotState::default();
@@ -350,10 +370,11 @@ impl MomeApp {
     fn pick_open_path(&mut self, frame: &eframe::Frame) -> Option<PathBuf> {
         let mut dialog = rfd::FileDialog::new()
             .set_title("열기")
-            .add_filter("텍스트 파일 (*.txt, *.md, *.json)", &["txt", "md", "json"])
+            .add_filter("텍스트 파일 (*.txt, *.md, *.json, *.canvas)", &["txt", "md", "json", "canvas"])
             .add_filter("텍스트 문서 (*.txt)", &["txt"])
             .add_filter("Markdown (*.md)", &["md"])
             .add_filter("JSON (*.json)", &["json"])
+            .add_filter("옵시디언 캔버스 (*.canvas)", &["canvas"])
             .add_filter("모든 파일 (*.*)", &["*"])
             .set_parent(frame);
         if let Some(dir) = self.doc.path.as_deref().and_then(Path::parent) {
@@ -383,7 +404,12 @@ impl MomeApp {
     }
 
     fn pick_save_path(&self, frame: &eframe::Frame, title: &str) -> Option<PathBuf> {
-        const TYPES: [(&str, &str); 3] = [("텍스트 문서 (*.txt)", "txt"), ("Markdown (*.md)", "md"), ("JSON (*.json)", "json")];
+        const TYPES: [(&str, &str); 4] = [
+            ("텍스트 문서 (*.txt)", "txt"),
+            ("Markdown (*.md)", "md"),
+            ("JSON (*.json)", "json"),
+            ("옵시디언 캔버스 (*.canvas)", "canvas"),
+        ];
         // The current file's type comes first, so the dialog does not offer to add ".txt".
         let ext = self.doc.path.as_deref().and_then(Path::extension).map(|e| e.to_string_lossy().to_lowercase());
         let current = TYPES.iter().position(|(_, e)| Some(*e) == ext.as_deref());
@@ -896,7 +922,7 @@ impl eframe::App for MomeApp {
             self.check_external_change(ctx);
             if self.dialog.is_none() {
                 self.handle_shortcuts(ctx);
-                if self.editor.before_frame(ctx, &mut self.doc.text) {
+                if self.reading().is_none() && self.editor.before_frame(ctx, &mut self.doc.text) {
                     self.on_text_changed();
                 }
             }
@@ -919,7 +945,10 @@ impl eframe::App for MomeApp {
         if self.settings.show_status_bar {
             self.status_bar(ui);
         }
-        self.editor_panel(ui);
+        match self.reading() {
+            Some(kind) => self.reader_panel(ui, kind),
+            None => self.editor_panel(ui),
+        }
         self.dialogs(&ctx, frame);
         self.paint_drop_hint(&ctx);
 
