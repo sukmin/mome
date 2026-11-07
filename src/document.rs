@@ -15,59 +15,125 @@ const LARGE_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Creates or truncates `path`, writes `bytes` and waits until they are on the disk.
 pub fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_all_synced(std::fs::File::create(path)?, bytes)
+}
+
+fn write_all_synced(mut file: std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
-    file.sync_all()
+    sync(&file)
+}
+
+/// Flushes `file` to the disk. Drives that cannot flush (some network and virtual
+/// drives answer "invalid function" or "not supported") have taken the data anyway.
+fn sync(file: &std::fs::File) -> std::io::Result<()> {
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    match file.sync_all() {
+        Err(e) if matches!(e.raw_os_error(), Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)) => Ok(()),
+        other => other,
+    }
+}
+
+/// Overwrites `path` without a temporary file. The space is claimed first, so a full
+/// disk fails before anything is overwritten instead of leaving the file cut short.
+fn write_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path)?;
+    let len = bytes.len() as u64;
+    if len > file.metadata()?.len() {
+        file.set_len(len)?;
+    }
+    file.write_all(bytes)?;
+    file.set_len(len)?;
+    sync(&file)
 }
 
 /// Writes `bytes` to `path` so that a crash or power cut never leaves a half-written file:
 /// the data goes to a temporary file next to it, is flushed, and then replaces the
 /// original with `ReplaceFileW` (which keeps its attributes and permissions).
-/// Falls back to writing in place when that is not possible (e.g. read-only folder).
+/// Writes in place only when no file can be created next to it (e.g. a folder we may
+/// write files in but not create them); a failed write (full disk) is reported
+/// without touching the original.
 pub fn write_file_safely(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_MERGE_ERRORS};
 
-    let write_direct = || write_synced(path, bytes);
     // A symbolic link is written through, keeping the link.
     let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
     let Some(name) = path.file_name().filter(|_| !is_link) else {
-        return write_direct();
+        return write_in_place(path, bytes);
     };
-    let tmp = path.with_file_name(format!(".{}.mome-saving", name.to_string_lossy()));
-    if write_synced(&tmp, bytes).is_err() {
+    // The process id keeps two windows saving the same file apart.
+    let side = |what: &str| path.with_file_name(format!(".{}.{}.mome-{what}", name.to_string_lossy(), std::process::id()));
+    let tmp = side("saving");
+    let file = match std::fs::File::create(&tmp) {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("cannot create {} ({err}); writing in place", tmp.display());
+            return write_in_place(path, bytes);
+        }
+    };
+    if let Err(err) = write_all_synced(file, bytes) {
         let _ = std::fs::remove_file(&tmp);
-        return write_direct();
+        return Err(err);
     }
     if !path.exists() {
         return std::fs::rename(&tmp, path).or_else(|_| {
             let _ = std::fs::remove_file(&tmp);
-            write_direct()
+            write_in_place(path, bytes)
         });
     }
+    // With a backup name, a half-done replacement leaves the original under that
+    // name instead of a name we cannot know.
+    let backup = side("backup");
     let target = crate::win::wide_path(path);
     let replacement = crate::win::wide_path(&tmp);
+    let backup_w = crate::win::wide_path(&backup);
     let ok = unsafe {
         ReplaceFileW(
             target.as_ptr(),
             replacement.as_ptr(),
-            std::ptr::null(),
+            backup_w.as_ptr(),
             REPLACEFILE_IGNORE_MERGE_ERRORS,
             std::ptr::null(),
             std::ptr::null(),
         )
     } != 0;
     if ok {
-        Ok(())
-    } else {
-        log::warn!(
-            "ReplaceFileW failed for {} ({}); writing in place",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-        let _ = std::fs::remove_file(&tmp);
-        write_direct()
+        let _ = std::fs::remove_file(&backup);
+        return Ok(());
     }
+    log::warn!("ReplaceFileW failed for {} ({})", path.display(), std::io::Error::last_os_error());
+    if !path.exists() {
+        // The original was moved aside but the new file not put in its place
+        // (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2): finish by hand, or put the original back.
+        return match std::fs::rename(&tmp, path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&backup);
+                Ok(())
+            }
+            Err(err) => {
+                if backup.exists() {
+                    let _ = std::fs::rename(&backup, path);
+                }
+                Err(kept_in(err, &tmp))
+            }
+        };
+    }
+    // The original is untouched: write in place, keeping the new text in the
+    // temporary file until that has worked.
+    match write_in_place(path, bytes) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(())
+        }
+        Err(err) => Err(kept_in(err, &tmp)),
+    }
+}
+
+/// `err`, saying that the text is safe in `tmp`.
+fn kept_in(err: std::io::Error, tmp: &Path) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{err} (저장하려던 내용은 {}에 남아 있습니다)", tmp.display()))
 }
 
 pub fn hash_text(text: &str) -> u64 {
@@ -112,6 +178,14 @@ pub struct Document {
     /// (binary file or wrong encoding) or NUL characters were replaced. Saving over the
     /// original would change those parts, so the user is asked first.
     pub lossy: bool,
+    /// The file exists but could not be read (e.g. its drive was not connected yet
+    /// when the window was restored), so the text is not its contents. Saving over
+    /// it is confirmed first.
+    pub unread: bool,
+    /// The text came from a revision or a restored session, not from the file:
+    /// the original is not written by "원본 파일에도 자동 저장" until the user saves
+    /// once (the file may have changed meanwhile, or the text is an old version).
+    pub autosave_blocked: bool,
 }
 
 /// What the user should be told after loading a file.
@@ -139,6 +213,8 @@ impl Document {
             current_hash: empty_hash,
             disk_stamp: None,
             lossy: false,
+            unread: false,
+            autosave_blocked: false,
         }
     }
 
@@ -177,6 +253,8 @@ impl Document {
             current_hash: hash,
             disk_stamp: DiskStamp::of(path),
             lossy: decoded.lossy || decoded.had_nul,
+            unread: false,
+            autosave_blocked: false,
         };
         let report = LoadReport {
             lossy: decoded.lossy,
@@ -186,12 +264,26 @@ impl Document {
         Ok((doc, report))
     }
 
-    /// Loads `path`, or starts an empty document for it if the file cannot be read
-    /// (e.g. it was deleted since).
-    pub fn load_or_new(path: &Path, forced: Option<Encoding>) -> Self {
+    /// Loads `path`, or starts an empty document for it if the file is gone. A file
+    /// that is there but cannot be read now gives an empty document marked
+    /// [`Self::unread`], and a warning for the user.
+    pub fn load_or_new(path: &Path, forced: Option<Encoding>) -> (Self, Option<String>) {
         match Self::load(path, forced) {
-            Ok((doc, _)) => doc,
-            Err(_) => Self::new_at(path),
+            Ok((doc, _)) => (doc, None),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Self::new_at(path), None),
+            Err(err) => {
+                log::warn!("cannot read {}: {err}", path.display());
+                let mut doc = Self::new_at(path);
+                doc.unread = true;
+                // A stamp no real file has: once the file can be read, it counts as
+                // changed on disk and the user is offered to load it.
+                doc.disk_stamp = Some(DiskStamp { modified: None, len: u64::MAX });
+                let warning = format!(
+                    "'{}' 파일을 읽지 못했습니다({err}). 드라이브가 연결되었는지 확인한 뒤 [파일 > 열기]로 다시 여세요.",
+                    path.display()
+                );
+                (doc, Some(warning))
+            }
         }
     }
 
@@ -227,6 +319,8 @@ impl Document {
         }
         // What is on disk now is exactly our text.
         self.lossy = false;
+        self.unread = false;
+        self.autosave_blocked = false;
         self.saved_hash = self.current_hash;
         self.saved_encoding = self.encoding;
         self.saved_line_ending = self.line_ending;
@@ -304,6 +398,26 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
         let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(leftovers.len(), 1, "temporary file left behind: {leftovers:?}");
+
+        // Writing in place grows and shrinks the file exactly.
+        write_in_place(&path, b"a much longer third version").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"a much longer third version");
+        write_in_place(&path, b"4th").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"4th");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_file_is_not_an_empty_one() {
+        let dir = std::env::temp_dir().join(format!("mome-unread-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("폴더.txt")).unwrap();
+        // Gone: an ordinary new document.
+        let (doc, warning) = Document::load_or_new(&dir.join("없음.txt"), None);
+        assert!(!doc.unread && warning.is_none());
+        // There but unreadable (here: a folder): marked, with a warning.
+        let (doc, warning) = Document::load_or_new(&dir.join("폴더.txt"), None);
+        assert!(doc.unread && warning.is_some());
+        assert!(doc.text.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

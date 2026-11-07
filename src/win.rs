@@ -70,6 +70,17 @@ pub fn open_folder(path: &Path) {
     }
 }
 
+/// Opens Explorer on the folder holding `path`, with the file selected, without
+/// opening the file itself.
+pub fn show_in_folder(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    // Explorer wants `/select,"path"` as one raw argument; paths cannot contain quotes.
+    let arg = format!("/select,\"{}\"", path.display());
+    if let Err(err) = std::process::Command::new("explorer.exe").raw_arg(arg).spawn() {
+        log::error!("could not start Explorer: {err}");
+    }
+}
+
 /// Starts another mome window.
 pub fn spawn_self(args: &[&std::ffi::OsStr]) {
     match std::env::current_exe() {

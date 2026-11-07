@@ -9,6 +9,8 @@ use crate::stats::{MANUSCRIPT_COLUMNS, MANUSCRIPT_ROWS};
 const TEXT_SIZE: f32 = 13.0;
 /// egui's default separator spacing.
 const SEPARATOR_WIDTH: f32 = 6.0;
+/// Space kept for the message on the left before optional segments are shown.
+const MESSAGE_ROOM: f32 = 120.0;
 
 /// Width a segment and the separator after it take up in the bar.
 fn segment_width(ui: &Ui, text: &str) -> f32 {
@@ -123,6 +125,20 @@ impl MomeApp {
                         let position = ui.add(segment(position)).on_hover_text("클릭하여 줄로 이동 (Ctrl+G)");
                         if position.clicked() {
                             self.pending_cmds.push(Cmd::GoTo);
+                        }
+
+                        // Invisible characters, if any and if there is room to spare.
+                        let invisible = self.marked_invisible_count();
+                        if invisible > 0 && self.reading().is_none() {
+                            let text = format!("보이지 않는 문자 {}개", group_digits(invisible));
+                            if ui.available_width() >= segment_width(ui, &text) + MESSAGE_ROOM {
+                                ui.separator();
+                                let button = Button::new(RichText::new(text).size(TEXT_SIZE).color(p.invisible))
+                                    .frame_when_inactive(false);
+                                if ui.add(button).on_hover_text("클릭하여 보이지 않는 문자 찾기 (Ctrl+Shift+I)").clicked() {
+                                    self.pending_cmds.push(Cmd::FindInvisible);
+                                }
+                            }
                         }
 
                         // Left side: the latest message, or when the last revision was written.

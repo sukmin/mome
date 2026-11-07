@@ -6,6 +6,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+/// Held while one process reads, changes and writes the settings file.
+struct SettingsLock(windows_sys::Win32::Foundation::HANDLE);
+
+impl SettingsLock {
+    /// Waits up to a few seconds; on failure the update goes ahead unlocked.
+    fn acquire() -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let name = crate::win::wide("Local\\mome-settings");
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        match unsafe { WaitForSingleObject(handle, 5000) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(Self(handle)),
+            _ => {
+                unsafe { CloseHandle(handle) };
+                None
+            }
+        }
+    }
+}
+
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
 pub const DEFAULT_SNAPSHOT_SECS: u64 = 10;
 pub const MIN_SNAPSHOT_SECS: u64 = 5;
 pub const MAX_SNAPSHOT_SECS: u64 = 600;
@@ -101,6 +135,8 @@ pub struct Settings {
     pub dark_mode: bool,
     pub word_wrap: bool,
     pub show_status_bar: bool,
+    /// Mark zero-width characters, special spaces and the like in the text.
+    pub show_invisible: bool,
     pub font: FontChoice,
     /// Named `placement` rather than `window`, which held egui points before; an old
     /// `window` entry is ignored.
@@ -120,6 +156,7 @@ impl Default for Settings {
             dark_mode: false,
             word_wrap: true,
             show_status_bar: true,
+            show_invisible: true,
             font: FontChoice::default(),
             placement: None,
             recent_files: Vec::new(),
@@ -146,7 +183,15 @@ impl Settings {
                 settings
             }
             Err(err) => {
-                log::warn!("ignoring unreadable settings {}: {err}", path.display());
+                // Defaults are used, and the next change writes them over the file:
+                // keep a copy so the old settings can still be looked at.
+                let backup = path.with_extension("json.bad");
+                log::warn!(
+                    "ignoring unreadable settings {}: {err}; copy kept as {}",
+                    path.display(),
+                    backup.display()
+                );
+                let _ = std::fs::copy(path, &backup);
                 Self::default()
             }
         }
@@ -159,6 +204,8 @@ impl Settings {
     /// only writes the fields it actually changed.
     pub fn update_on_disk(change: impl Fn(&mut Settings)) {
         let path = paths::settings_file();
+        // Windows closing together must not read and write the file over each other.
+        let _lock = SettingsLock::acquire();
         let mut on_disk = Self::load_from(&path);
         change(&mut on_disk);
         if let Err(err) = on_disk.save_to(&path) {
@@ -171,9 +218,13 @@ impl Settings {
             std::fs::create_dir_all(dir)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        // Write next to the target and rename, so a crash never leaves half a file.
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
+        // Write next to the target, flush, and rename, so a crash or power cut never
+        // leaves half a file. The process id keeps windows from sharing the file.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if let Err(err) = crate::document::write_synced(&tmp, json.as_bytes()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
         std::fs::rename(&tmp, path)
     }
 

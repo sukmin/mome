@@ -124,6 +124,7 @@ impl MomeApp {
         self.item(ui, "이전 찾기", Cmd::FindPrev, true);
         self.item(ui, "바꾸기…", Cmd::Replace, true);
         self.item(ui, "줄로 이동…", Cmd::GoTo, true);
+        self.item(ui, "보이지 않는 문자 찾기…", Cmd::FindInvisible, true);
         ui.separator();
         self.item(ui, "모두 선택", Cmd::SelectAll, true);
         self.item(ui, "시간/날짜", Cmd::TimeDate, true);
@@ -178,6 +179,8 @@ impl MomeApp {
         }
         let status = self.settings.show_status_bar;
         self.check_item(ui, "상태 표시줄", status, Cmd::ToggleStatusBar);
+        let invisible = self.settings.show_invisible;
+        self.check_item(ui, "보이지 않는 문자 표시", invisible, Cmd::ToggleShowInvisible);
         let dark = self.settings.dark_mode;
         self.check_item(ui, "다크 모드", dark, Cmd::ToggleDark);
     }

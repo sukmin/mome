@@ -33,25 +33,52 @@ fn fold(c: char) -> char {
     }
 }
 
-/// All non-overlapping matches of `query`, in order.
+/// All non-overlapping matches of `query`, in order (at most [`MAX_MATCHES`]).
 pub fn find_all(text: &str, query: &str, opts: FindOptions) -> Vec<Match> {
-    if query.is_empty() || text.is_empty() {
-        return Vec::new();
+    find_from(text, 0, query, opts).0
+}
+
+/// Every match, however many (for "모두 바꾸기").
+pub fn find_every(text: &str, query: &str, opts: FindOptions) -> Vec<Match> {
+    let mut all = Vec::new();
+    let mut from = 0;
+    loop {
+        let (batch, more) = find_from(text, from, query, opts);
+        all.extend(batch);
+        match more {
+            Some(next) if next > from => from = next,
+            _ => return all,
+        }
     }
+}
+
+/// Like [`find_all`], from byte `from` on; positions still count from the start of
+/// `text`, and whole words are judged with the text before `from`. Also returns
+/// where to go on if the search stopped at a limit.
+fn find_from(text: &str, from: usize, query: &str, opts: FindOptions) -> (Vec<Match>, Option<usize>) {
+    if query.is_empty() || from >= text.len() {
+        return (Vec::new(), None);
+    }
+    let rest = &text[from..];
     let byte_matches = if opts.match_case {
-        text.match_indices(query)
+        rest.match_indices(query)
+            .take(MAX_CANDIDATES)
             .map(|(start, m)| start..start + m.len())
             .collect::<Vec<_>>()
     } else if query.is_ascii() {
-        find_ascii_case_insensitive(text, query)
+        find_ascii_case_insensitive(rest, query)
     } else {
-        find_folded(text, query)
+        find_folded(rest, query)
     };
+    // The candidate list itself may have been cut short.
+    let candidates_cut = byte_matches.len() >= MAX_CANDIDATES;
+    let last_candidate = byte_matches.last().map(|b| b.end + from);
 
     let mut out = Vec::new();
-    let mut char_pos = 0;
-    let mut byte_pos = 0;
+    let mut char_pos = text[..from].chars().count();
+    let mut byte_pos = from;
     for bytes in byte_matches {
+        let bytes = bytes.start + from..bytes.end + from;
         if opts.whole_word {
             let before = text[..bytes.start].chars().next_back();
             let after = text[bytes.end..].chars().next();
@@ -68,12 +95,12 @@ pub fn find_all(text: &str, query: &str, opts: FindOptions) -> Vec<Match> {
         char_pos += len;
         byte_pos = bytes.end;
         if out.len() >= MAX_MATCHES {
-            break;
+            return (out, Some(bytes.end));
         }
     }
-    out
+    let more = if candidates_cut { last_candidate } else { None };
+    (out, more)
 }
-
 /// Byte-wise search; an ASCII needle can only match ASCII bytes, so this is exact.
 fn find_ascii_case_insensitive(text: &str, query: &str) -> Vec<Range<usize>> {
     let hay = text.as_bytes();
@@ -206,6 +233,20 @@ mod tests {
         assert_eq!(next_match(&m, 4..5, true, false), None);
         assert_eq!(next_match(&m, 0..1, false, true), Some(2));
         assert_eq!(next_match(&m, 2..2, false, false), Some(0));
+    }
+
+    #[test]
+    fn finds_every_match_past_the_limit() {
+        let text = "a ".repeat(MAX_MATCHES + 1234);
+        assert_eq!(find_all(&text, "a", FindOptions::default()).len(), MAX_MATCHES);
+        let every = find_every(&text, "a", FindOptions::default());
+        assert_eq!(every.len(), MAX_MATCHES + 1234);
+        let last = every.last().unwrap();
+        assert_eq!(last.chars, (MAX_MATCHES + 1233) * 2..(MAX_MATCHES + 1233) * 2 + 1);
+        // Whole words over a cut-off candidate list: "ab" is a candidate but no word.
+        let text = "ab a ".repeat(MAX_MATCHES + 10);
+        let words = FindOptions { whole_word: true, match_case: true };
+        assert_eq!(find_every(&text, "a", words).len(), MAX_MATCHES + 10);
     }
 
     #[test]

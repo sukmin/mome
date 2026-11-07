@@ -318,19 +318,32 @@ fn remove_if_empty(dir: &Path) {
 }
 
 /// Which revisions to delete: only those older than the retention period.
-/// Every revision inside the period is kept.
+/// Every revision inside the period is kept, and so is the newest one: it may be
+/// the only copy of text still open, unsaved, in a window.
 fn plan_cleanup(revisions: &[LocalTime], now: &LocalTime, retention_days: u32) -> Vec<usize> {
     let limit = now.to_seconds() - retention_days as i64 * 86_400;
+    let newest = revisions
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, time)| time.to_seconds())
+        .map(|(i, _)| i);
     revisions
         .iter()
         .enumerate()
-        .filter(|(_, time)| time.to_seconds() < limit)
+        .filter(|(i, time)| time.to_seconds() < limit && Some(*i) != newest)
         .map(|(i, _)| i)
         .collect()
 }
 
-/// Applies the retention policy to every document folder. Returns the number of files removed.
-fn cleanup(root: &Path, retention_days: u32, now: &LocalTime) -> usize {
+/// A path in a form that compares equal however it was written.
+pub fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
+/// Applies the retention policy to every document folder, never touching the
+/// revisions in `in_use` (see [`path_key`]): those that session records point to,
+/// for restoring or recovering windows. Returns the number of files removed.
+fn cleanup(root: &Path, retention_days: u32, now: &LocalTime, in_use: &std::collections::HashSet<String>) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
@@ -343,6 +356,9 @@ fn cleanup(root: &Path, retention_days: u32, now: &LocalTime) -> usize {
         let revisions = list_revisions(&dir);
         let times: Vec<LocalTime> = revisions.iter().map(|r| r.time).collect();
         for i in plan_cleanup(&times, now, retention_days) {
+            if in_use.contains(&path_key(&revisions[i].path)) {
+                continue;
+            }
             if std::fs::remove_file(&revisions[i].path).is_ok() {
                 removed += 1;
             }
@@ -427,7 +443,8 @@ fn run_job(job: Job) -> Option<WriterEvent> {
             }
         },
         Job::Cleanup { root, retention_days } => {
-            let removed = cleanup(&root, retention_days, &LocalTime::now());
+            let in_use = crate::session::revisions_in_use();
+            let removed = cleanup(&root, retention_days, &LocalTime::now(), &in_use);
             if removed > 0 {
                 log::info!("history cleanup removed {removed} old revisions");
             }
@@ -487,6 +504,9 @@ mod tests {
         ];
         assert_eq!(plan_cleanup(&revs, &now, 30), vec![3, 4]);
         assert_eq!(plan_cleanup(&revs, &now, 1), vec![2, 3, 4]);
+        // All past the period: the newest stays, wherever it is in the list.
+        let old = vec![t("20260101-000000-000"), t("20260301-000000-000"), t("20260201-000000-000")];
+        assert_eq!(plan_cleanup(&old, &now, 30), vec![0, 2]);
     }
 
     #[test]
@@ -519,8 +539,20 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].count, 2);
 
+        // An older revision that a session record still points to.
+        let older = SnapshotJob {
+            time: t("20261001-100000-000"),
+            ..job.clone()
+        };
+        let p0 = write_snapshot(&older).unwrap();
+        let in_use = std::collections::HashSet::from([path_key(&p0)]);
+
+        // Everything is past its retention, but the newest revision and the one in
+        // use stay.
         let far_future = t("20270101-000000-000");
-        assert_eq!(cleanup(&root, 30, &far_future), 2);
+        assert_eq!(cleanup(&root, 30, &far_future, &in_use), 1);
+        assert!(p0.exists());
+        assert_eq!(list_revisions(&job.dir()).len(), 2);
         assert!(job.dir().join("keep-me.txt").exists());
         assert!(root.join("other").join("20200101-000000-000_auto.txt").exists());
         let _ = std::fs::remove_dir_all(&root);

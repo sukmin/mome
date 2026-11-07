@@ -19,6 +19,8 @@ pub struct Palette {
     pub match_bg: Color32,
     pub current_match_bg: Color32,
     pub warning: Color32,
+    /// Markers on invisible characters in the text.
+    pub invisible: Color32,
 }
 
 pub const LIGHT: Palette = Palette {
@@ -33,6 +35,7 @@ pub const LIGHT: Palette = Palette {
     match_bg: Color32::from_rgb(0xFF, 0xEE, 0x99),
     current_match_bg: Color32::from_rgb(0xF5, 0xB9, 0x42),
     warning: Color32::from_rgb(0xB0, 0x3A, 0x00),
+    invisible: Color32::from_rgb(0xD0, 0x00, 0x70),
 };
 
 pub const DARK: Palette = Palette {
@@ -47,6 +50,7 @@ pub const DARK: Palette = Palette {
     match_bg: Color32::from_rgb(0x61, 0x4D, 0x12),
     current_match_bg: Color32::from_rgb(0x9C, 0x6B, 0x00),
     warning: Color32::from_rgb(0xFF, 0xA0, 0x60),
+    invisible: Color32::from_rgb(0xFF, 0x5F, 0xB0),
 };
 
 pub fn palette(dark: bool) -> Palette {

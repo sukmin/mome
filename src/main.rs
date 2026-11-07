@@ -15,6 +15,7 @@ mod find;
 mod fonts;
 mod history;
 mod canvas;
+mod invisible;
 mod json;
 mod logging;
 mod markdown;

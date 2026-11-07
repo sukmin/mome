@@ -461,7 +461,9 @@ impl MomeApp {
                 None
             })
         });
-        answer(choice, dismissed, Outcome::Discard)
+        // A click outside or Esc only puts the question off to the next start;
+        // "복구 안 함" is the one way to let the text go.
+        answer(choice, dismissed, Outcome::Close)
     }
 
     fn encoding_fallback_ui(&self, ctx: &Context, sample: char) -> Outcome {
@@ -490,13 +492,23 @@ impl MomeApp {
         let enter = enter_pressed(ctx);
         let title = self.doc.title();
         let label = self.doc.encoding.label();
+        let unread = self.doc.unread;
         let (choice, dismissed) = modal(ctx, "dlg-lossy", 460.0, "원래 내용이 손상될 수 있습니다", |ui| {
-            ui.label(format!(
-                "'{title}' 파일에는 {label} 인코딩으로 읽지 못한 내용이 있어 '�'로 표시되어 있습니다. \
-                 이대로 저장하면 그 부분의 원래 내용이 사라집니다."
-            ));
-            ui.add_space(4.0);
-            hint(ui, "텍스트 파일이라면 [인코딩 > 다른 인코딩으로 다시 열기]를 먼저 사용해 보세요.", &p);
+            if unread {
+                ui.label(format!(
+                    "'{title}' 파일을 읽지 못한 채로 열려 있습니다. \
+                     이대로 저장하면 파일의 원래 내용이 지금 화면의 내용으로 바뀝니다."
+                ));
+                ui.add_space(4.0);
+                hint(ui, "드라이브가 연결되었다면 [파일 > 열기]로 파일을 다시 열어 보세요.", &p);
+            } else {
+                ui.label(format!(
+                    "'{title}' 파일에는 {label} 인코딩으로 읽지 못한 내용이 있어 '�'로 표시되어 있습니다. \
+                     이대로 저장하면 그 부분의 원래 내용이 사라집니다."
+                ));
+                ui.add_space(4.0);
+                hint(ui, "텍스트 파일이라면 [인코딩 > 다른 인코딩으로 다시 열기]를 먼저 사용해 보세요.", &p);
+            }
             // The safe choice is the highlighted one here.
             buttons(ui, |ui| {
                 if primary(ui, "취소", &p).clicked() || enter {
@@ -661,8 +673,15 @@ impl MomeApp {
             Outcome::Reload => {
                 self.close_dialog();
                 if let Some(path) = self.doc.path.clone() {
-                    self.snapshot_sync(RevisionKind::Reload);
-                    self.open_path(ctx, &path, None);
+                    if self.snapshot_sync(RevisionKind::Reload) {
+                        self.open_path(ctx, &path, None);
+                    } else {
+                        self.show_error(
+                            "다시 불러오지 않았습니다",
+                            "지금 내용을 임시 저장 폴더에 남기지 못해서, 다시 불러오면 사라지게 됩니다. \
+                             [다른 이름으로 저장]으로 먼저 저장해 주세요.",
+                        );
+                    }
                 }
             }
             Outcome::KeepMine => {
@@ -695,8 +714,10 @@ impl MomeApp {
             Outcome::SaveLossy => {
                 if let Dialog::LossySave { path, after } = dialog {
                     self.close_dialog();
-                    // The user accepted that unreadable bytes become '�'.
+                    // The user accepted that unreadable bytes become '�' (or that
+                    // the unread file is replaced).
                     self.doc.lossy = false;
+                    self.doc.unread = false;
                     self.save_to(ctx, &path, after);
                 }
             }

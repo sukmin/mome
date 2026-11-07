@@ -49,6 +49,7 @@ pub enum Cmd {
     SelectAll,
     TimeDate,
     ToggleOverwrite,
+    FindInvisible,
     // 서식 / 보기
     ToggleWrap,
     Font,
@@ -58,6 +59,7 @@ pub enum Cmd {
     ZoomOut,
     ZoomReset,
     ToggleStatusBar,
+    ToggleShowInvisible,
     ToggleDark,
     // 인코딩
     SetEncoding(Encoding),
@@ -81,6 +83,7 @@ const SHORTCUTS: &[(Modifiers, Key, Cmd)] = &[
     (CMD, Key::S, Cmd::Save),
     (CMD_SHIFT, Key::R, Cmd::History),
     (CMD, Key::P, Cmd::Print),
+    (CMD_SHIFT, Key::I, Cmd::FindInvisible),
     (CMD, Key::F, Cmd::Find),
     (Modifiers::SHIFT, Key::F3, Cmd::FindPrev),
     (Modifiers::NONE, Key::F3, Cmd::FindNext),
@@ -107,6 +110,7 @@ pub(super) const SHORTCUT_HELP: &[(&str, &str)] = &[
     ("Ctrl+Z / Ctrl+Y", "실행 취소 / 다시 실행"),
     ("Ctrl+F / Ctrl+H", "찾기 / 바꾸기"),
     ("F3 / Shift+F3", "다음 찾기 / 이전 찾기"),
+    ("Ctrl+Shift+I", "보이지 않는 문자 찾기"),
     ("Ctrl+G", "줄로 이동"),
     ("Ctrl+E", "읽기 모드 / 편집 모드 전환 (Markdown·캔버스)"),
     ("F5", "시간/날짜 삽입"),
@@ -137,6 +141,7 @@ pub fn shortcut_text(cmd: &Cmd) -> &'static str {
         Cmd::FindNext => "F3",
         Cmd::FindPrev => "Shift+F3",
         Cmd::Replace => "Ctrl+H",
+        Cmd::FindInvisible => "Ctrl+Shift+I",
         Cmd::GoTo => "Ctrl+G",
         Cmd::ToggleReader => "Ctrl+E",
         Cmd::SelectAll => "Ctrl+A",
@@ -167,6 +172,9 @@ impl MomeApp {
         if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.find.close();
             self.editor.request_focus();
+        } else if self.invisible.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.invisible.close();
+            self.editor.request_focus();
         }
         // Ctrl + mouse wheel zooms the text (the canvas zooms itself).
         let zoom = if self.reading() == Some(ViewKind::Canvas) { 1.0 } else { ctx.input(|i| i.zoom_delta()) };
@@ -182,6 +190,11 @@ impl MomeApp {
             match cmd {
                 // Overwrite mode means nothing while reading.
                 Cmd::ToggleOverwrite => return,
+                // The menu cannot reach the text selected in the reader; Ctrl+C can.
+                Cmd::Copy => {
+                    self.notify("읽기 화면에서는 글을 끌어 선택한 뒤 Ctrl+C를 누르면 복사됩니다.".to_owned());
+                    return;
+                }
                 Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset if kind == ViewKind::Canvas => {
                     match cmd {
                         Cmd::ZoomIn => self.viewer.zoom_canvas(1.25),
@@ -194,7 +207,6 @@ impl MomeApp {
                 Cmd::Undo
                 | Cmd::Redo
                 | Cmd::Cut
-                | Cmd::Copy
                 | Cmd::Paste
                 | Cmd::Delete
                 | Cmd::Find
@@ -204,6 +216,7 @@ impl MomeApp {
                 | Cmd::GoTo
                 | Cmd::SelectAll
                 | Cmd::TimeDate
+                | Cmd::FindInvisible
                 | Cmd::FormatJson => self.set_reading(false),
                 _ => {}
             }
@@ -296,6 +309,7 @@ impl MomeApp {
                 self.editor.overwrite = !self.editor.overwrite;
                 self.editor.request_focus();
             }
+            Cmd::FindInvisible => self.open_invisible(),
 
             Cmd::ToggleWrap => {
                 let wrap = !self.settings.word_wrap;
@@ -322,6 +336,10 @@ impl MomeApp {
             Cmd::ToggleStatusBar => {
                 let show = !self.settings.show_status_bar;
                 self.change_settings(|s| s.show_status_bar = show);
+            }
+            Cmd::ToggleShowInvisible => {
+                let show = !self.settings.show_invisible;
+                self.change_settings(|s| s.show_invisible = show);
             }
             Cmd::ToggleDark => {
                 let dark = !self.settings.dark_mode;

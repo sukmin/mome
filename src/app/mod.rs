@@ -4,6 +4,7 @@ mod commands;
 mod dialogs;
 mod editor;
 mod findbar;
+mod invisible_bar;
 mod menu;
 mod recovery;
 mod status;
@@ -35,6 +36,7 @@ pub use commands::Cmd;
 use dialogs::{Dialog, SettingsForm};
 use editor::Editor;
 use findbar::FindBar;
+use invisible_bar::InvisibleState;
 use recovery::doc_from_revision;
 use viewer::{ViewKind, Viewer};
 
@@ -88,6 +90,8 @@ pub struct MomeApp {
     stats: TextStats,
     editor: Editor,
     find: FindBar,
+    /// 보이지 않는 문자 찾기 (the bar, and the markers in the text).
+    invisible: InvisibleState,
     /// 읽기 모드 (Markdown and canvas reader).
     viewer: Viewer,
     dialog: Option<Dialog>,
@@ -136,7 +140,6 @@ impl MomeApp {
 
         // Images in Markdown and canvases; ours goes last so it is asked first.
         egui_extras::install_image_loaders(ctx);
-        ctx.add_bytes_loader(std::sync::Arc::new(crate::markdown::LocalFileLoader::default()));
 
         let mut fonts = FontStore::default();
         ctx.set_fonts(fonts.definitions(&settings.font, None));
@@ -162,6 +165,7 @@ impl MomeApp {
             stats: TextStats::default(),
             editor: Editor::new(),
             find: FindBar::default(),
+            invisible: InvisibleState::default(),
             viewer: Viewer::default(),
             dialog: None,
             dialog_queue: VecDeque::new(),
@@ -185,6 +189,8 @@ impl MomeApp {
             session_text_at: Instant::now(),
         };
         app.find.options = app.settings.find.clone();
+        // Our loader goes last so it is asked first for `file:` pictures.
+        ctx.add_bytes_loader(app.viewer.loader.clone());
         app.start(ctx, launch);
         app
     }
@@ -236,6 +242,7 @@ impl MomeApp {
                     "About" => Cmd::About,
                     "ToggleDark" => Cmd::ToggleDark,
                     "FormatJson" => Cmd::FormatJson,
+                    "FindInvisible" => Cmd::FindInvisible,
                     "ToggleReader" => Cmd::ToggleReader,
                     "ZoomIn" => Cmd::ZoomIn,
                     "ZoomOut" => Cmd::ZoomOut,
@@ -269,6 +276,10 @@ impl MomeApp {
         };
         self.viewer.reset();
         self.viewer.on = reading;
+        if reading {
+            // The find bar works on the hidden text; it must not stay over the reader.
+            self.find.close();
+        }
         self.stats = TextStats::compute(&self.doc.text);
         self.text_version += 1;
         self.snapshot = SnapshotState::default();
@@ -350,6 +361,8 @@ impl MomeApp {
                     self.notify_warning("파일의 NUL 문자를 '�'로 바꿨습니다. 저장하면 NUL 문자는 사라집니다.".to_owned());
                 } else if report.large {
                     self.notify_warning("파일이 커서 편집이 느릴 수 있습니다.".to_owned());
+                } else {
+                    self.warn_invisible();
                 }
                 true
             }
@@ -441,8 +454,9 @@ impl MomeApp {
     }
 
     fn save_to(&mut self, ctx: &egui::Context, path: &Path, after: Option<After>) -> bool {
-        if self.doc.lossy && self.doc.path.as_deref() == Some(path) {
-            // Saving would replace bytes we could not read with '�'.
+        if (self.doc.lossy || self.doc.unread) && self.doc.path.as_deref() == Some(path) {
+            // Saving would replace bytes we could not read with '�', or a file we
+            // could not read at all.
             self.open_dialog(Dialog::LossySave {
                 path: path.to_path_buf(),
                 after,
@@ -547,7 +561,15 @@ impl MomeApp {
 
     /// "저장 안 함": keep the text in the history anyway, then continue.
     fn discard_then(&mut self, ctx: &egui::Context, after: After) {
-        self.snapshot_sync(RevisionKind::Close);
+        if !self.snapshot_sync(RevisionKind::Close) {
+            // The dialog promised the text stays in the history; it would not.
+            self.show_error(
+                "임시 저장하지 못했습니다",
+                "저장하지 않은 내용을 임시 저장 폴더에 남기지 못해서 닫지 않았습니다. \
+                 임시 저장 폴더(USB·네트워크 드라이브라면 연결 상태)를 확인하거나 [다른 이름으로 저장]으로 저장해 주세요.",
+            );
+            return;
+        }
         self.continue_after(ctx, None, after);
     }
 
@@ -583,15 +605,23 @@ impl MomeApp {
         true
     }
 
-    /// Writes a revision right away (when the window is about to go away).
-    fn snapshot_sync(&mut self, kind: RevisionKind) {
+    /// Writes a revision right away (when the text is about to go away). Returns
+    /// false if unsaved text should have been kept but could not be written.
+    fn snapshot_sync(&mut self, kind: RevisionKind) -> bool {
         if !self.doc.is_modified() || self.snapshot.last_hash == Some(self.doc.current_hash) {
-            return;
+            return true;
         }
-        if let Some(job) = self.snapshot_job(kind) {
-            match history::write_snapshot(&job) {
-                Ok(_) => self.snapshot.last_hash = Some(self.doc.current_hash),
-                Err(err) => log::error!("could not keep unsaved text: {err}"),
+        let Some(job) = self.snapshot_job(kind) else {
+            return true; // No temporary save folder: nothing was promised.
+        };
+        match history::write_snapshot(&job) {
+            Ok(_) => {
+                self.snapshot.last_hash = Some(self.doc.current_hash);
+                true
+            }
+            Err(err) => {
+                log::error!("could not keep unsaved text: {err}");
+                false
             }
         }
     }
@@ -622,6 +652,11 @@ impl MomeApp {
             self.notify_warning(
                 "제대로 읽지 못한 글자가 있는 파일이라 원본 파일 자동 저장을 건너뛰었습니다.".to_owned(),
             );
+            return;
+        }
+        if self.doc.autosave_blocked || self.doc.unread {
+            // Restored or old text, or a file we could not read: only a save the
+            // user makes may replace the file.
             return;
         }
         if self.doc.changed_on_disk() {
@@ -669,6 +704,10 @@ impl MomeApp {
                 }
                 WriterEvent::Failed { error } => {
                     self.notify_warning(format!("임시 저장하지 못했습니다: {error}"));
+                    // The text is not in the history after all: try again later, and
+                    // do not count it as kept when the window closes.
+                    self.snapshot.last_hash = None;
+                    self.snapshot.dirty_since.get_or_insert_with(Instant::now);
                 }
             }
         }
@@ -863,7 +902,11 @@ impl MomeApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.editor_bg))
             .show(ui, |ui| {
-                self.find.refresh(&self.doc.text, self.text_version);
+                // Searching every edit is only needed to show the matches; F3 with the
+                // bar closed searches when pressed.
+                if self.find.open {
+                    self.find.refresh(&self.doc.text, self.text_version);
+                }
                 let opts = editor::ShowOptions {
                     font: self.editor_font(),
                     wrap: self.settings.word_wrap,
@@ -872,10 +915,14 @@ impl MomeApp {
                     current: self.find.current,
                     match_bg: p.match_bg,
                     current_bg: p.current_match_bg,
+                    marks: if self.settings.show_invisible { &self.invisible.marks } else { &[] },
+                    mark_color: p.invisible,
                 };
                 let output = self.editor.show(ui, &mut self.doc.text, &opts);
                 if output.changed {
                     self.on_text_changed();
+                    // The markers were placed for the text before this edit.
+                    ui.ctx().request_repaint();
                 }
                 self.context_menu(&output.response);
             });
@@ -937,10 +984,14 @@ impl eframe::App for MomeApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.rebuild_fonts(&ctx);
+        self.refresh_invisible();
 
         self.menu_bar(ui);
-        if self.find.open {
+        if self.find.open && self.reading().is_none() {
             self.find_bar(ui);
+        }
+        if self.invisible.open && self.reading().is_none() {
+            self.invisible_bar(ui);
         }
         if self.settings.show_status_bar {
             self.status_bar(ui);

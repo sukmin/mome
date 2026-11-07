@@ -213,6 +213,22 @@ pub fn load_record(sid: &str) -> Option<SessionRecord> {
     serde_json::from_str(&text).ok()
 }
 
+/// The revisions every session record points to (as [`crate::history::path_key`]):
+/// text that windows, running or to be restored or recovered, still need.
+pub fn revisions_in_use() -> std::collections::HashSet<String> {
+    let Ok(entries) = std::fs::read_dir(paths::sessions_dir()) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let record = load_record(name.strip_suffix(".json")?)?;
+            record.revision.map(|p| crate::history::path_key(&p))
+        })
+        .collect()
+}
+
 pub fn delete_record(sid: &str) {
     let _ = std::fs::remove_file(record_path(sid));
     let _ = std::fs::remove_file(fallback_text_path(sid));
@@ -360,7 +376,8 @@ fn prepare_for_shutdown(hwnd: HWND, data: &HookData) {
             }
             if !s.record.modified {
                 s.record.revision = None;
-            } else if s.revision_hash != Some(s.text_hash) || s.record.revision.is_none() {
+            } else if s.revision_hash != Some(s.text_hash) || !s.record.revision.as_ref().is_some_and(|p| p.exists()) {
+                // (Also when the revision file has gone missing since it was written.)
                 match save_text_for_restore(&s, sid) {
                     Ok(path) => {
                         s.record.revision = Some(path);

@@ -234,14 +234,23 @@ impl MomeApp {
     }
 
     fn replace_all(&mut self, ctx: &egui::Context) {
-        self.find.refresh(&self.doc.text, self.text_version);
-        let count = self.find.matches.len();
+        // Not the highlighted matches, which stop at find::MAX_MATCHES.
+        let matches = find::find_every(&self.doc.text, &self.find.query, self.find.find_options());
+        let count = matches.len();
         if count == 0 {
             self.find.message = Some(format!("'{}'을(를) 찾을 수 없습니다.", self.find.query));
             return;
         }
-        let text = find::replace_all(&self.doc.text, &self.find.matches, &self.find.replacement);
-        let cursor = self.editor.cursor(ctx).min(text.chars().count());
+        let text = find::replace_all(&self.doc.text, &matches, &self.find.replacement);
+        // Keep the cursor next to the same text: shift it by what changed before it.
+        let cursor = self.editor.cursor(ctx);
+        let replacement_len = self.find.replacement.chars().count() as isize;
+        let shift: isize = matches
+            .iter()
+            .filter(|m| m.chars.end <= cursor)
+            .map(|m| replacement_len - m.chars.len() as isize)
+            .sum();
+        let cursor = ((cursor as isize + shift).max(0) as usize).min(text.chars().count());
         self.editor.apply_edit(ctx, &mut self.doc.text, text, (cursor, cursor));
         self.on_text_changed();
         // Put the focus in the text so Ctrl+Z undoes the replacement, not the field.
@@ -378,7 +387,7 @@ enum FindAction {
     Close,
 }
 
-fn close_button(ui: &mut Ui, color: egui::Color32) -> egui::Response {
+pub(super) fn close_button(ui: &mut Ui, color: egui::Color32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
     if response.hovered() {
         ui.painter()

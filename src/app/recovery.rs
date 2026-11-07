@@ -41,8 +41,10 @@ impl MomeApp {
         let mut records = records.into_iter();
         if pristine {
             if let Some(first) = records.next() {
-                session::delete_record(&first.sid);
+                // Read first: without a temporary save folder the text lives next to
+                // the record and goes with it.
                 self.restore_record(ctx, &first);
+                session::delete_record(&first.sid);
                 if !self.message.as_ref().is_some_and(|m| m.warning) {
                     self.notify("저장하지 않은 문서를 복구했습니다.".to_owned());
                 }
@@ -57,23 +59,25 @@ impl MomeApp {
 /// Rebuilds a document from a session record. Returns a warning if the unsaved
 /// text could not be found.
 pub(super) fn doc_from_record(record: &SessionRecord) -> (Document, Option<String>) {
-    let mut doc = match &record.path {
+    let (mut doc, mut warning) = match &record.path {
         // Read the file the same way it was read before, so an encoding chosen with
         // "다른 인코딩으로 다시 열기" is kept.
         Some(path) => Document::load_or_new(path, record.file_encoding),
-        None => Document::new_untitled(),
+        None => (Document::new_untitled(), None),
     };
     if !record.doc_key.is_empty() {
         doc.doc_key = record.doc_key.clone();
     }
     doc.encoding = record.encoding;
     doc.line_ending = record.line_ending;
-    let mut warning = None;
     if record.modified {
         match record.revision.as_deref().map(history::read_revision) {
             Some(Ok(text)) => {
                 doc.text = text;
                 doc.text_changed();
+                // The file may have changed while the PC was off; do not overwrite it
+                // behind the user's back.
+                doc.autosave_blocked = true;
             }
             _ => {
                 log::error!("unsaved text of session {} is missing", record.sid);
@@ -93,7 +97,7 @@ pub(super) fn doc_from_revision(path: &Path) -> std::io::Result<Document> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let info = history::read_doc_info(dir);
     let mut doc = match info.as_ref().and_then(|i| i.path.as_ref()) {
-        Some(original) => Document::load_or_new(original, None),
+        Some(original) => Document::load_or_new(original, None).0,
         None => {
             // Never saved: keep adding revisions to the same folder.
             let mut doc = Document::new_untitled();
@@ -109,5 +113,7 @@ pub(super) fn doc_from_revision(path: &Path) -> std::io::Result<Document> {
     }
     doc.text = text;
     doc.text_changed();
+    // An old version: it reaches the original file only when the user saves it.
+    doc.autosave_blocked = true;
     Ok(doc)
 }

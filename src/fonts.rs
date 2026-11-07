@@ -174,6 +174,12 @@ impl FontStore {
         let bytes = std::fs::read(file)
             .map_err(|err| log::warn!("cannot read font {}: {err}", file.display()))
             .ok()?;
+        // egui panics on a font it cannot parse; a damaged file must never reach it
+        // (once chosen, it would stop mome from starting at all).
+        if let Err(err) = skrifa::FontRef::from_index(&bytes, index) {
+            log::warn!("cannot use font {} #{index}: {err}", file.display());
+            return None;
+        }
         let mut data = FontData::from_owned(bytes);
         data.index = index;
         let data = Arc::new(data);

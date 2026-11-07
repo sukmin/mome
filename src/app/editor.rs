@@ -6,8 +6,8 @@ use std::sync::Arc;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::text_edit::TextEditState;
 use egui::{
-    Align, Color32, Context, Event, EventFilter, FontId, Frame, Galley, Id, ImeEvent, Margin,
-    Response, ScrollArea, TextBuffer, TextEdit, Ui, Vec2,
+    Align, Color32, Context, Event, EventFilter, FontId, Frame, Galley, Id, ImeEvent, Margin, Pos2,
+    Response, ScrollArea, Stroke, StrokeKind, TextBuffer, TextEdit, Ui, Vec2,
 };
 
 use crate::find::Match;
@@ -56,6 +56,9 @@ pub struct ShowOptions<'a> {
     pub current: Option<usize>,
     pub match_bg: Color32,
     pub current_bg: Color32,
+    /// Character indices of invisible characters to mark, ascending.
+    pub marks: &'a [usize],
+    pub mark_color: Color32,
 }
 
 pub struct ShowOutput {
@@ -169,6 +172,12 @@ impl Editor {
         let after = CCursorRange::two(CCursor::new(selection.0), CCursor::new(selection.1));
         let mut undoer = state.undoer();
         undoer.add_undo(&(before, text.clone()));
+        if new_text != *text {
+            // A new edit makes what was undone before it unreachable, as in any editor;
+            // otherwise Ctrl+Y would bring it back over this edit. `redo` with a state
+            // other than the last undo point clears the redo list.
+            let _ = undoer.redo(&(after, new_text.clone()));
+        }
         *text = new_text;
         undoer.add_undo(&(after, text.clone()));
         state.set_undoer(undoer);
@@ -183,6 +192,17 @@ impl Editor {
     /// Returns true if `text` was modified.
     pub fn before_frame(&mut self, ctx: &Context, text: &mut String) -> bool {
         let mut changed = false;
+        // Ctrl+V: winit turns only "\r\n" into "\n"; a lone CR must become a line
+        // break too, or it would be saved as a bare CR (menu paste does the same).
+        ctx.input_mut(|i| {
+            for event in &mut i.events {
+                if let Event::Paste(pasted) = event {
+                    if pasted.contains('\r') {
+                        *pasted = crate::encoding::normalize_newlines(pasted);
+                    }
+                }
+            }
+        });
         let has_focus = ctx.memory(|m| m.has_focus(self.id));
         let range = TextEditState::load(ctx, self.id).and_then(|s| s.cursor.char_range());
         if range.is_some_and(|r| r.is_empty()) {
@@ -296,6 +316,7 @@ impl Editor {
                     .min_size(Vec2::new(width, available.y))
                     .layouter(&mut layouter);
                 let out = edit.show(ui);
+                paint_marks(ui, &out.galley, out.galley_pos, opts.marks, opts.mark_color);
                 if scroll_to_cursor {
                     if let Some(range) = TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range()) {
                         let rect = out
@@ -371,6 +392,50 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
         job.append(&text[last..], 0.0, base);
     }
     job
+}
+
+/// Marks the invisible characters at character indices `marks` (ascending) that are
+/// on screen: a box around those that take up space, and a bar with a small
+/// triangle on top where a zero-width one sits.
+fn paint_marks(ui: &Ui, galley: &Galley, origin: Pos2, marks: &[usize], color: Color32) {
+    if marks.is_empty() {
+        return;
+    }
+    let clip = ui.clip_rect();
+    let painter = ui.painter();
+    let stroke = Stroke::new(1.5, color);
+    let mut next = 0; // Index into `marks`.
+    let mut row_start = 0; // Character index of the row's first character.
+    for row in &galley.rows {
+        let row_end = row_start + row.char_count_including_newline().0;
+        let row_rect = row.rect().translate(origin.to_vec2());
+        if row_rect.top() > clip.bottom() || next >= marks.len() {
+            break;
+        }
+        if row_rect.bottom() < clip.top() {
+            next += marks[next..].partition_point(|&m| m < row_end);
+        } else {
+            while next < marks.len() && marks[next] < row_end {
+                if let Some(glyph) = row.glyphs.get(marks[next] - row_start) {
+                    let r = glyph.logical_rect().translate(row.pos.to_vec2() + origin.to_vec2());
+                    if r.width() >= 3.0 {
+                        painter.rect(r.shrink(1.0), 2.0, color.gamma_multiply(0.18), stroke, StrokeKind::Inside);
+                    } else {
+                        let x = r.left();
+                        painter.line_segment([Pos2::new(x, r.top() + 2.0), Pos2::new(x, r.bottom() - 2.0)], stroke);
+                        let top = r.top() + 1.0;
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![Pos2::new(x - 4.0, top), Pos2::new(x + 4.0, top), Pos2::new(x, top + 5.0)],
+                            color,
+                            Stroke::NONE,
+                        ));
+                    }
+                }
+                next += 1;
+            }
+        }
+        row_start = row_end;
+    }
 }
 
 /// Deletes up to `count` characters starting at character index `at`, stopping at a

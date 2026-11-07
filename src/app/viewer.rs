@@ -1,7 +1,9 @@
 //! 읽기 모드: Markdown shown formatted, and Obsidian canvases drawn as boards.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use egui::epaint::CubicBezierShape;
 use egui::{
@@ -12,7 +14,7 @@ use egui_commonmark::{Alert, AlertBundle, CommonMarkCache, CommonMarkViewer};
 
 use super::{Cmd, MomeApp};
 use crate::canvas::{self, Canvas, NodeKind};
-use crate::markdown::{self, LinkTarget};
+use crate::markdown::{self, LinkTarget, LocalFileLoader};
 use crate::theme::Palette;
 use crate::win;
 
@@ -39,19 +41,29 @@ const COLUMN_WIDTH: f32 = 820.0;
 /// Space around a canvas when it is fitted into the window.
 const FIT_MARGIN: f32 = 80.0;
 const NODE_RADIUS: u8 = 8;
+const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.05..=2.0;
+/// Note cards show at most this much of a note.
+const CARD_READ_LIMIT: u64 = 512 * 1024;
 
 pub struct Viewer {
     /// The reader is showing instead of the editor.
     pub on: bool,
+    /// Reads local pictures; registered with egui in `MomeApp::new`.
+    pub loader: Arc<LocalFileLoader>,
     cache: CommonMarkCache,
     alerts: AlertBundle,
-    /// Markdown rewritten for the viewer, and the text version it was made from.
-    prepared: Option<(u64, String)>,
+    /// Markdown rewritten for the viewer, the text version it was made from, and
+    /// whether it has callouts.
+    prepared: Option<(u64, String, bool)>,
     canvas: Option<(u64, Result<Canvas, String>)>,
     /// What part of the canvas is in view (canvas coordinates).
     scene_rect: Rect,
+    /// Where the canvas was shown last frame (screen coordinates).
+    view: Rect,
     /// Fit the whole canvas into view on the next frame.
     fit: bool,
+    /// Drop cached pictures, so edited ones are read again.
+    forget_images: bool,
     /// Contents of canvas file cards, by the path written in the canvas.
     files: HashMap<String, FileCard>,
 }
@@ -66,12 +78,15 @@ impl Default for Viewer {
     fn default() -> Self {
         Self {
             on: false,
+            loader: Arc::default(),
             cache: CommonMarkCache::default(),
             alerts: korean_alerts(),
             prepared: None,
             canvas: None,
             scene_rect: Rect::NOTHING,
+            view: Rect::NOTHING,
             fit: true,
+            forget_images: false,
             files: HashMap::new(),
         }
     }
@@ -84,18 +99,22 @@ impl Viewer {
         self.canvas = None;
         self.files.clear();
         self.fit = true;
+        self.forget_images = true;
     }
 
     pub fn fit_canvas(&mut self) {
         self.fit = true;
     }
 
-    /// Zooms the canvas by `factor` around the middle of the view.
+    /// Zooms the canvas by `factor` around the middle of the view, within the
+    /// zoom range (so zooming back out works at once after hitting the limit).
     pub fn zoom_canvas(&mut self, factor: f32) {
-        if self.scene_rect.is_positive() {
-            let c = self.scene_rect.center();
-            self.scene_rect = Rect::from_center_size(c, self.scene_rect.size() / factor);
+        if !self.scene_rect.is_positive() || !self.view.is_positive() {
+            return;
         }
+        let scale = (self.view.size() / self.scene_rect.size()).min_elem();
+        let target = (scale * factor).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+        self.scene_rect = Rect::from_center_size(self.scene_rect.center(), self.view.size() / target);
     }
 }
 
@@ -126,6 +145,20 @@ fn reading_style(ui: &mut Ui, scale: f32) {
     ]
     .into();
     style.spacing.item_spacing = Vec2::new(8.0, 7.0) * scale;
+}
+
+/// Files a link may hand to their own program: pictures, PDFs, sound and video.
+/// Anything else (programs, scripts, shortcuts, installers, Office files with
+/// macros…) is only shown in Explorer, so a link in a downloaded note cannot run it.
+fn safe_to_open(path: &Path) -> bool {
+    const SAFE: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tif", "tiff", "heic", "pdf", "mp3", "wav",
+        "m4a", "flac", "ogg", "aac", "mp4", "mov", "avi", "mkv", "webm",
+    ];
+    // No alternate data streams (`a.exe:b.png`): the only ':' is the drive's.
+    let colons = path.to_string_lossy().matches(':').count();
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    colons <= 1 && ext.is_some_and(|e| SAFE.contains(&e.as_str()))
 }
 
 /// Files a link may open in mome rather than in their own program.
@@ -175,6 +208,7 @@ impl MomeApp {
         if on && !self.viewer.on {
             // Pick up edits made since the reader was last shown.
             self.viewer.files.clear();
+            self.viewer.forget_images = true;
         }
         self.viewer.on = on;
     }
@@ -185,6 +219,10 @@ impl MomeApp {
 
     pub(super) fn reader_panel(&mut self, ui: &mut Ui, kind: ViewKind) {
         let p = self.palette();
+        self.viewer.loader.set_document_dir(self.doc_dir().as_deref());
+        if std::mem::take(&mut self.viewer.forget_images) {
+            ui.ctx().forget_all_images();
+        }
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(p.editor_bg))
             .show(ui, |ui| match kind {
@@ -196,16 +234,19 @@ impl MomeApp {
     fn markdown_view(&mut self, ui: &mut Ui) {
         let dir = self.doc_dir();
         let version = self.text_version;
-        if self.viewer.prepared.as_ref().is_none_or(|(v, _)| *v != version) {
+        if self.viewer.prepared.as_ref().is_none_or(|(v, ..)| *v != version) {
             let text = markdown::prepare(&self.doc.text, dir.as_deref());
-            self.viewer.prepared = Some((version, text));
+            let callouts = text.contains("[!");
+            self.viewer.prepared = Some((version, text, callouts));
         }
         let scale = self.editor.zoom as f32 / 100.0;
         let base = dir.as_deref().map(markdown::base_uri).unwrap_or_else(|| "file:///".to_owned());
         let viewer = &mut self.viewer;
-        let text = viewer.prepared.as_ref().map(|(_, t)| t.as_str()).unwrap_or_default();
+        let (text, callouts) = viewer.prepared.as_ref().map(|(_, t, c)| (t.as_str(), *c)).unwrap_or_default();
+        let alerts = if callouts { viewer.alerts.clone() } else { AlertBundle::empty() };
         ScrollArea::vertical()
-            .id_salt("mome-reader")
+            // Each note starts at its top.
+            .id_salt(("mome-reader", &self.doc.path))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let full = ui.available_width();
@@ -223,7 +264,7 @@ impl MomeApp {
                         }
                         CommonMarkViewer::new()
                             .default_implicit_uri_scheme(base)
-                            .alerts(viewer.alerts.clone())
+                            .alerts(alerts)
                             .max_image_width(Some(column as usize))
                             .show(ui, &mut viewer.cache, text);
                     });
@@ -243,17 +284,29 @@ impl MomeApp {
                 LinkTarget::Missing(name) => {
                     self.notify_warning(format!("'{name}'을(를) 찾을 수 없습니다."));
                 }
+                LinkTarget::Anchor => {}
+                LinkTarget::Blocked(path) => {
+                    self.notify_warning(format!("다른 컴퓨터(네트워크 경로)를 가리키는 링크라서 열지 않았습니다: {path}"));
+                }
             }
         }
     }
 
     /// Opens a linked file: text in this window (a new one with Ctrl or the middle
-    /// button), anything else in its own program.
+    /// button), pictures and the like in their own program, and anything that
+    /// could run only shown in Explorer.
     fn open_link(&mut self, path: &Path, new_window: bool) {
         if !path.exists() {
             self.notify_warning(format!("'{}'을(를) 찾을 수 없습니다.", path.display()));
-        } else if !opens_in_mome(path) {
+        } else if path.is_dir() || safe_to_open(path) {
+            // A folder opens in Explorer; pictures and the like in their viewer.
             win::open_folder(path);
+        } else if !opens_in_mome(path) {
+            win::show_in_folder(path);
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.notify_warning(format!(
+                "'{name}'은(는) 실행될 수 있는 파일이라 직접 열지 않고 탐색기에서 위치만 보여 줍니다."
+            ));
         } else if new_window {
             win::spawn_self(&[path.as_os_str()]);
         } else {
@@ -307,18 +360,21 @@ impl MomeApp {
         }
 
         let panel = ui.max_rect();
+        self.viewer.view = panel;
         let viewer = &mut self.viewer;
         let Some((_, Ok(canvas))) = &viewer.canvas else {
             return;
         };
         let mut clicked_file: Option<(PathBuf, bool)> = None;
         egui::Scene::new()
-            .zoom_range(0.05..=2.0)
+            .zoom_range(ZOOM_RANGE)
             .max_inner_size(Vec2::splat(1.0e6))
             .show(ui, &mut viewer.scene_rect, |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
                 reading_style(ui, 1.0);
                 let painter = ui.painter().clone();
+                // Only what is in view is drawn (canvas coordinates).
+                let visible = ui.clip_rect();
 
                 // Groups first (largest at the back), then edges, then cards.
                 let mut groups: Vec<_> = canvas.nodes.iter().filter(|n| n.is_group()).collect();
@@ -326,6 +382,10 @@ impl MomeApp {
                 for node in groups {
                     let NodeKind::Group { label } = &node.kind else { continue };
                     let rect = node.rect();
+                    // The label sits above the box.
+                    if !rect.expand2(Vec2::new(0.0, 30.0)).intersects(visible) {
+                        continue;
+                    }
                     let color = canvas::color(node.color.as_deref()).unwrap_or(p.weak);
                     painter.rect(
                         rect,
@@ -349,12 +409,19 @@ impl MomeApp {
                     let (Some(from), Some(to)) = (canvas.node(&edge.from_node), canvas.node(&edge.to_node)) else {
                         continue;
                     };
+                    // Curves bulge out by up to 300 points (see paint_edge).
+                    if !from.rect().union(to.rect()).expand(300.0).intersects(visible) {
+                        continue;
+                    }
                     let color = canvas::color(edge.color.as_deref()).unwrap_or(p.weak);
                     paint_edge(&painter, edge, from.rect(), to.rect(), color, p);
                 }
 
                 for node in canvas.nodes.iter().filter(|n| !n.is_group()) {
                     let rect = node.rect();
+                    if !rect.intersects(visible) {
+                        continue;
+                    }
                     let color = canvas::color(node.color.as_deref());
                     let fill = match color {
                         Some(c) => blend(p.editor_bg, c, 0.10),
@@ -373,9 +440,11 @@ impl MomeApp {
                         match &node.kind {
                             NodeKind::Text { text } => {
                                 let base = root.as_deref().map(markdown::base_uri).unwrap_or_default();
+                                let alerts =
+                                    if text.contains("[!") { viewer.alerts.clone() } else { AlertBundle::empty() };
                                 CommonMarkViewer::new()
                                     .default_implicit_uri_scheme(base)
-                                    .alerts(viewer.alerts.clone())
+                                    .alerts(alerts)
                                     .max_image_width(Some(inner.width() as usize))
                                     .show(ui, &mut viewer.cache, text);
                             }
@@ -438,7 +507,11 @@ impl MomeApp {
 }
 
 fn load_file_card(file: &str, dir: Option<&Path>, root: Option<&Path>) -> FileCard {
-    let direct = root.map(|r| r.join(file)).filter(|p| p.is_file());
+    // Cards name files inside the vault; never `C:\…` or another computer.
+    if !markdown::is_relative_name(file) {
+        return FileCard::Other { path: None };
+    }
+    let direct = root.map(|r| r.join(file)).filter(|p| markdown::may_read(p, dir) && p.is_file());
     let path = direct.or_else(|| dir.and_then(|d| markdown::find_file(file, d)));
     let Some(path) = path else {
         return FileCard::Other { path: None };
@@ -452,7 +525,9 @@ fn load_file_card(file: &str, dir: Option<&Path>, root: Option<&Path>) -> FileCa
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("txt"));
     if is_note {
-        if let Ok(bytes) = std::fs::read(&path) {
+        let mut bytes = Vec::new();
+        let read = std::fs::File::open(&path).and_then(|f| f.take(CARD_READ_LIMIT).read_to_end(&mut bytes));
+        if read.is_ok() {
             let decoded = crate::encoding::decode(&bytes, None);
             let base = path.parent().map(Path::to_path_buf);
             let text = markdown::prepare(&decoded.text, base.as_deref());
@@ -594,5 +669,17 @@ mod tests {
         assert!(!is_local("mailto:a@b.c"));
         assert!(opens_in_mome(Path::new("a.md")));
         assert!(!opens_in_mome(Path::new("a.pdf")));
+    }
+
+    #[test]
+    fn links_never_run_programs() {
+        assert!(safe_to_open(Path::new(r"C:\v\그림.PNG")));
+        assert!(safe_to_open(Path::new(r"C:\v\문서.pdf")));
+        for risky in [
+            "a.exe", "a.bat", "a.cmd", "a.ps1", "a.vbs", "a.js", "a.lnk", "a.url", "a.msi", "a.scr", "a.hta",
+            "a.docm", "a.exe.", "a", r"a.exe:b.png",
+        ] {
+            assert!(!safe_to_open(&Path::new(r"C:\v").join(risky)), "{risky}");
+        }
     }
 }
