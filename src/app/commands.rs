@@ -82,6 +82,8 @@ const SHORTCUTS: &[(Modifiers, Key, Cmd)] = &[
     (CMD_SHIFT, Key::S, Cmd::SaveAs),
     (CMD, Key::S, Cmd::Save),
     (CMD_SHIFT, Key::R, Cmd::History),
+    // IntelliJ's replace key; Ctrl+H (Notepad's) stays too.
+    (CMD, Key::R, Cmd::Replace),
     (CMD, Key::P, Cmd::Print),
     (CMD_SHIFT, Key::I, Cmd::FindInvisible),
     (CMD, Key::F, Cmd::Find),
@@ -108,8 +110,11 @@ pub(super) const SHORTCUT_HELP: &[(&str, &str)] = &[
     ("Ctrl+Shift+R", "임시 저장 기록"),
     ("Ctrl+P", "인쇄"),
     ("Ctrl+Z / Ctrl+Y", "실행 취소 / 다시 실행"),
-    ("Ctrl+F / Ctrl+H", "찾기 / 바꾸기"),
+    ("Ctrl+F / Ctrl+R", "찾기 / 바꾸기 (Ctrl+H도 바꾸기)"),
     ("F3 / Shift+F3", "다음 찾기 / 이전 찾기"),
+    ("Enter / Shift+Enter", "찾기 표시줄에서 다음 / 이전 찾기"),
+    ("Alt+C / Alt+O / Alt+X", "찾기 표시줄: 대/소문자 구분 / 단어 단위 / 정규식"),
+    ("Alt+P / Alt+A / Alt+L", "찾기 표시줄: 바꾸기 / 모두 바꾸기 / 제외"),
     ("Ctrl+Shift+I", "보이지 않는 문자 찾기"),
     ("Ctrl+G", "줄로 이동"),
     ("Ctrl+E", "읽기 모드 / 편집 모드 전환 (Markdown·캔버스)"),
@@ -140,7 +145,7 @@ pub fn shortcut_text(cmd: &Cmd) -> &'static str {
         Cmd::Find => "Ctrl+F",
         Cmd::FindNext => "F3",
         Cmd::FindPrev => "Shift+F3",
-        Cmd::Replace => "Ctrl+H",
+        Cmd::Replace => "Ctrl+R",
         Cmd::FindInvisible => "Ctrl+Shift+I",
         Cmd::GoTo => "Ctrl+G",
         Cmd::ToggleReader => "Ctrl+E",
@@ -153,6 +158,23 @@ pub fn shortcut_text(cmd: &Cmd) -> &'static str {
         Cmd::Shortcuts => "F1",
         _ => "",
     }
+}
+
+/// Alt+letter types nothing, as in Notepad: Windows sends the letter with the key
+/// (WM_SYSCHAR) and egui would insert it. AltGr is not reported as Alt, and
+/// Alt+numpad codes arrive when Alt is released, so neither is affected.
+fn drop_alt_letters(ctx: &egui::Context) {
+    ctx.input_mut(|i| {
+        let mut k = 0;
+        while k + 1 < i.events.len() {
+            let alt_key = matches!(&i.events[k], egui::Event::Key { pressed: true, modifiers, .. }
+                if modifiers.alt && !modifiers.ctrl && !modifiers.command);
+            if alt_key && matches!(i.events[k + 1], egui::Event::Text(_)) {
+                i.events.remove(k + 1);
+            }
+            k += 1;
+        }
+    });
 }
 
 impl MomeApp {
@@ -169,6 +191,8 @@ impl MomeApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Insert)) {
             self.pending_cmds.push(Cmd::ToggleOverwrite);
         }
+        self.find_bar_keys(ctx);
+        drop_alt_letters(ctx);
         if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             self.find.close();
             self.editor.request_focus();
@@ -417,5 +441,36 @@ fn key_event(key: Key, modifiers: Modifiers) -> Event {
         pressed: true,
         repeat: false,
         modifiers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alt_letters_type_nothing() {
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let text = |s: &str| egui::Event::Text(s.to_owned());
+        let altgr = Modifiers { alt: true, ctrl: true, ..Default::default() };
+        let events = vec![
+            key(Key::Q, Modifiers::ALT),
+            text("q"),
+            key(Key::W, Modifiers::NONE),
+            text("w"),
+            key(Key::E, altgr),
+            text("€"),
+        ];
+        let ctx = egui::Context::default();
+        let mut left = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            drop_alt_letters(ui.ctx());
+            left = ui.input(|i| i.events.iter().filter_map(|e| match e {
+                egui::Event::Text(t) => Some(t.clone()),
+                _ => None,
+            }).collect::<Vec<_>>());
+        });
+        output.textures_delta.clear();
+        assert_eq!(left, ["w", "€"]);
     }
 }

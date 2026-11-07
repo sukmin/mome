@@ -56,6 +56,13 @@ pub struct ShowOptions<'a> {
     pub current: Option<usize>,
     pub match_bg: Color32,
     pub current_bg: Color32,
+    /// For each of `highlights`: left out of replacing (struck through).
+    pub excluded: &'a [bool],
+    /// What the highlighted match will be replaced with, shown under it, and the
+    /// character index where the match starts.
+    pub hint: Option<(usize, &'a str)>,
+    pub hint_bg: Color32,
+    pub hint_border: Color32,
     /// Character indices of invisible characters to mark, ascending.
     pub marks: &'a [usize],
     pub mark_color: Color32,
@@ -317,6 +324,9 @@ impl Editor {
                     .layouter(&mut layouter);
                 let out = edit.show(ui);
                 paint_marks(ui, &out.galley, out.galley_pos, opts.marks, opts.mark_color);
+                if let Some((at, replacement)) = opts.hint {
+                    paint_hint(ui, &out.galley, out.galley_pos, at, replacement, opts);
+                }
                 if scroll_to_cursor {
                     if let Some(range) = TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range()) {
                         let rect = out
@@ -380,11 +390,17 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
             job.append(&text[last..m.bytes.start], 0.0, base.clone());
         }
         let mut format = base.clone();
+        let excluded = opts.excluded.get(i).copied().unwrap_or(false);
         format.background = if Some(i) == opts.current {
             opts.current_bg
+        } else if excluded {
+            Color32::TRANSPARENT
         } else {
             opts.match_bg
         };
+        if excluded {
+            format.strikethrough = Stroke::new(1.5, opts.text_color);
+        }
         job.append(&text[m.bytes.clone()], 0.0, format);
         last = m.bytes.end;
     }
@@ -392,6 +408,52 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
         job.append(&text[last..], 0.0, base);
     }
     job
+}
+
+/// Longest replacement preview shown, in characters.
+const HINT_CHARS: usize = 120;
+
+/// Shows what the highlighted match becomes in a small box under it (above it at
+/// the bottom of the view), like IntelliJ's replacement hint.
+fn paint_hint(ui: &Ui, galley: &Galley, origin: Pos2, at: usize, replacement: &str, opts: &ShowOptions) {
+    let row = galley
+        .pos_from_cursor(egui::text::CCursor::new(at))
+        .translate(origin.to_vec2());
+    let clip = ui.clip_rect();
+    if row.bottom() < clip.top() || row.top() > clip.bottom() {
+        return;
+    }
+    let mut shown: String = replacement
+        .chars()
+        .take(HINT_CHARS)
+        .map(|c| match c {
+            '\n' => '↵',
+            '\t' => '→',
+            c => c,
+        })
+        .collect();
+    if replacement.chars().nth(HINT_CHARS).is_some() {
+        shown.push('…');
+    }
+    let (shown, color) = if shown.is_empty() {
+        // A replacement was written but comes out empty here (e.g. `$2` of a group
+        // that took no part).
+        ("(빈 문자열로 바뀜)".to_owned(), opts.text_color.gamma_multiply(0.6))
+    } else {
+        (shown, opts.text_color)
+    };
+    let font = egui::FontId::new(opts.font.size * 0.9, opts.font.family.clone());
+    let painter = ui.painter();
+    let text = painter.layout_no_wrap(shown, font, color);
+    let pad = Vec2::new(6.0, 3.0);
+    let size = text.size() + pad * 2.0;
+    let mut min = Pos2::new(row.left(), row.bottom() + 2.0);
+    if min.y + size.y > clip.bottom() {
+        min.y = row.top() - 2.0 - size.y;
+    }
+    let rect = egui::Rect::from_min_size(min, size);
+    painter.rect(rect, 4.0, opts.hint_bg, Stroke::new(1.0, opts.hint_border), StrokeKind::Inside);
+    painter.galley(rect.min + pad, text, color);
 }
 
 /// Marks the invisible characters at character indices `marks` (ascending) that are

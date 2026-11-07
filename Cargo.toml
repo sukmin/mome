@@ -1,6 +1,6 @@
 [package]
 name = "mome"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "mome - a lightweight text editor for Windows 11"
 build = "build.rs"
@@ -19,6 +19,9 @@ serde_json = "1"
 log = "0.4"
 egui_commonmark = "0.25"
 egui_extras = { version = "0.36.2", features = ["image"] }
+# Without "variable-lookbehinds": like Java, a look-behind has a fixed length, and
+# `(?<=x.*)` cannot freeze the window.
+fancy-regex = { version = "0.20.0", default-features = false, features = ["std", "unicode", "perf"] }
 
 [dependencies.windows-sys]
 version = "0.61"

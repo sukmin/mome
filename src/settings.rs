@@ -111,6 +111,7 @@ pub struct FindSettings {
     pub match_case: bool,
     pub whole_word: bool,
     pub wrap_around: bool,
+    pub regex: bool,
 }
 
 impl Default for FindSettings {
@@ -119,6 +120,7 @@ impl Default for FindSettings {
             match_case: false,
             whole_word: false,
             wrap_around: true,
+            regex: false,
         }
     }
 }

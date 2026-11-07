@@ -526,13 +526,17 @@ impl MomeApp {
     fn shortcuts_ui(&self, ctx: &Context) -> Outcome {
         let p = self.palette();
         let enter = enter_pressed(ctx);
-        let (choice, dismissed) = modal(ctx, "dlg-shortcuts", 460.0, "단축키", |ui| {
-            egui::Grid::new("shortcut-grid").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
-                for (keys, what) in SHORTCUT_HELP {
-                    ui.label(RichText::new(*keys).monospace());
-                    ui.label(*what);
-                    ui.end_row();
-                }
+        // The list scrolls when the window is too short for it (title and button stay).
+        let list_height = (ctx.content_rect().height() - 200.0).max(160.0);
+        let (choice, dismissed) = modal(ctx, "dlg-shortcuts", 520.0, "단축키", |ui| {
+            ScrollArea::vertical().max_height(list_height).show(ui, |ui| {
+                egui::Grid::new("shortcut-grid").num_columns(2).spacing([24.0, 4.0]).show(ui, |ui| {
+                    for (keys, what) in SHORTCUT_HELP {
+                        ui.label(RichText::new(*keys).monospace());
+                        ui.label(*what);
+                        ui.end_row();
+                    }
+                });
             });
             buttons(ui, |ui| (primary(ui, "닫기", &p).clicked() || enter).then_some(Outcome::Close))
         });

@@ -237,6 +237,7 @@ impl MomeApp {
                     "Font" => Cmd::Font,
                     "Find" => Cmd::Find,
                     "Replace" => Cmd::Replace,
+                    "FindNext" => Cmd::FindNext,
                     "GoTo" => Cmd::GoTo,
                     "Shortcuts" => Cmd::Shortcuts,
                     "About" => Cmd::About,
@@ -250,6 +251,10 @@ impl MomeApp {
                 };
                 self.pending_cmds.push(cmd);
             }
+        }
+        // MOME_TEST_FIND=query|||replacement|||flags fills in the find bar.
+        if let Ok(spec) = std::env::var("MOME_TEST_FIND") {
+            self.test_find(&spec);
         }
         // MOME_TEST_DPI=96,144 pretends the window is dragged onto monitors with those
         // DPIs; the results go to the log.
@@ -904,17 +909,29 @@ impl MomeApp {
             .show(ui, |ui| {
                 // Searching every edit is only needed to show the matches; F3 with the
                 // bar closed searches when pressed.
-                if self.find.open {
+                let find_open = self.find.open;
+                if find_open {
                     self.find.refresh(&self.doc.text, self.text_version);
+                    self.find.update_preview(&self.doc.text);
                 }
                 let opts = editor::ShowOptions {
                     font: self.editor_font(),
                     wrap: self.settings.word_wrap,
                     text_color: p.editor_fg,
-                    highlights: if self.find.open { &self.find.matches } else { &[] },
+                    highlights: if find_open { &self.find.matches } else { &[] },
                     current: self.find.current,
                     match_bg: p.match_bg,
                     current_bg: p.current_match_bg,
+                    // Exclusions only mean something while replacing.
+                    excluded: if find_open && self.find.replace_mode { &self.find.excluded } else { &[] },
+                    hint: self
+                        .find
+                        .preview
+                        .as_ref()
+                        .filter(|_| find_open)
+                        .map(|(at, s)| (*at, s.as_str())),
+                    hint_bg: p.bar_bg,
+                    hint_border: p.accent,
                     marks: if self.settings.show_invisible { &self.invisible.marks } else { &[] },
                     mark_color: p.invisible,
                 };
