@@ -1,6 +1,7 @@
 //! The text area: an egui `TextEdit` plus what Notepad users expect from it
 //! (overwrite mode, programmatic selection, undoable edits, search highlights).
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
@@ -10,7 +11,9 @@ use egui::{
     Response, ScrollArea, Stroke, StrokeKind, TextBuffer, TextEdit, Ui, Vec2,
 };
 
+use crate::dockerfile;
 use crate::find::Match;
+use crate::theme::SyntaxColors;
 
 pub const ZOOM_MIN: u32 = 10;
 pub const ZOOM_MAX: u32 = 500;
@@ -66,6 +69,8 @@ pub struct ShowOptions<'a> {
     /// Character indices of invisible characters to mark, ascending.
     pub marks: &'a [usize],
     pub mark_color: Color32,
+    /// Set when the document is a Dockerfile, to color its syntax.
+    pub dockerfile: Option<SyntaxColors>,
 }
 
 pub struct ShowOutput {
@@ -370,6 +375,15 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
         line_height: Some(opts.font.size * crate::fonts::EDITOR_LINE_HEIGHT),
         ..Default::default()
     };
+    // Worked out from this very text, so unlike the matches never out of step with it.
+    let colored: Vec<(Range<usize>, Color32)> = match opts.dockerfile {
+        Some(colors) => dockerfile::spans(text)
+            .into_iter()
+            .map(|span| (span.range, colors.of(span.kind)))
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut colored = colored.as_slice();
     // Matches may be one frame behind the text while typing; never slice with them then.
     let valid = !opts.highlights.is_empty()
         && opts.highlights.iter().all(|m| {
@@ -378,7 +392,7 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
                 && text.is_char_boundary(m.bytes.end)
         });
     if !valid {
-        job.append(text, 0.0, base);
+        append_colored(&mut job, text, 0..text.len(), &base, &mut colored);
         return job;
     }
     let mut last = 0;
@@ -387,8 +401,9 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
             continue;
         }
         if m.bytes.start > last {
-            job.append(&text[last..m.bytes.start], 0.0, base.clone());
+            append_colored(&mut job, text, last..m.bytes.start, &base, &mut colored);
         }
+        // A match keeps the plain text color, which is readable on its background.
         let mut format = base.clone();
         let excluded = opts.excluded.get(i).copied().unwrap_or(false);
         format.background = if Some(i) == opts.current {
@@ -405,9 +420,45 @@ fn layout_job(text: &str, opts: &ShowOptions, wrap_width: f32) -> LayoutJob {
         last = m.bytes.end;
     }
     if last < text.len() || text.is_empty() {
-        job.append(&text[last..], 0.0, base);
+        append_colored(&mut job, text, last..text.len(), &base, &mut colored);
     }
     job
+}
+
+/// Appends `text[range]` in the colors of `colored` (ascending, not overlapping),
+/// dropping the ones used up so that the next call goes on from there.
+fn append_colored(
+    job: &mut LayoutJob,
+    text: &str,
+    range: Range<usize>,
+    base: &TextFormat,
+    colored: &mut &[(Range<usize>, Color32)],
+) {
+    let mut at = range.start;
+    while let Some(((span, color), rest)) = colored.split_first() {
+        if span.start >= range.end {
+            break;
+        }
+        let (from, to) = (span.start.max(at), span.end.min(range.end));
+        if from < to {
+            if from > at {
+                job.append(&text[at..from], 0.0, base.clone());
+            }
+            let format = TextFormat {
+                color: *color,
+                ..base.clone()
+            };
+            job.append(&text[from..to], 0.0, format);
+            at = to;
+        }
+        if span.end > range.end {
+            break; // The rest of it comes after a search match.
+        }
+        *colored = rest;
+    }
+    if at < range.end || range.is_empty() {
+        job.append(&text[at..range.end], 0.0, base.clone());
+    }
 }
 
 /// Longest replacement preview shown, in characters.
@@ -548,5 +599,113 @@ mod tests {
     fn byte_indices() {
         assert_eq!(byte_index("가a", 1), 3);
         assert_eq!(byte_index("가a", 5), 4);
+    }
+
+    const FG: Color32 = Color32::from_rgb(1, 2, 3);
+    const SYNTAX: SyntaxColors = crate::theme::LIGHT.syntax;
+
+    fn options(dockerfile: Option<SyntaxColors>, highlights: &[Match]) -> ShowOptions<'_> {
+        ShowOptions {
+            font: FontId::monospace(14.0),
+            wrap: true,
+            text_color: FG,
+            highlights,
+            current: None,
+            match_bg: Color32::YELLOW,
+            current_bg: Color32::RED,
+            excluded: &[],
+            hint: None,
+            hint_bg: Color32::BLACK,
+            hint_border: Color32::BLACK,
+            marks: &[],
+            mark_color: Color32::BLACK,
+            dockerfile,
+        }
+    }
+
+    /// The job's pieces as (text, text color).
+    fn pieces(job: &LayoutJob) -> Vec<(&str, Color32)> {
+        job.sections
+            .iter()
+            .map(|s| (&job.text[s.byte_range.start.0..s.byte_range.end.0], s.format.color))
+            .collect()
+    }
+
+    fn match_at(bytes: Range<usize>) -> Match {
+        Match {
+            chars: bytes.clone(),
+            bytes,
+            searched_from: 0,
+        }
+    }
+
+    #[test]
+    fn dockerfile_comments_are_faint() {
+        let text = "# 주석\nFROM a\n";
+        let job = layout_job(text, &options(Some(SYNTAX), &[]), 100.0);
+        assert_eq!(job.text, text);
+        assert_eq!(
+            pieces(&job),
+            [("# 주석", SYNTAX.comment), ("\n", FG), ("FROM", SYNTAX.keyword), (" a\n", FG)]
+        );
+    }
+
+    #[test]
+    fn other_documents_stay_plain() {
+        let text = "# 제목\nFROM a";
+        assert_eq!(pieces(&layout_job(text, &options(None, &[]), 100.0)), [(text, FG)]);
+        // An empty document still needs a section for its row.
+        assert_eq!(pieces(&layout_job("", &options(Some(SYNTAX), &[]), 100.0)), [("", FG)]);
+    }
+
+    #[test]
+    fn a_match_inside_colored_text_splits_it() {
+        // "주석" in the comment, and all of "FROM" plus the space after it.
+        let text = "# 주석 끝\nFROM a";
+        let found = [match_at(2..8), match_at(13..18)];
+        let job = layout_job(text, &options(Some(SYNTAX), &found), 100.0);
+        assert_eq!(job.text, text);
+        assert_eq!(
+            pieces(&job),
+            [
+                ("# ", SYNTAX.comment),
+                ("주석", FG),
+                (" 끝", SYNTAX.comment),
+                ("\n", FG),
+                ("FROM ", FG),
+                ("a", FG),
+            ]
+        );
+        assert_eq!(job.sections[1].format.background, Color32::YELLOW);
+    }
+
+    /// Colors and search matches cut the text up differently; it must stay whole
+    /// wherever they fall, also with matches out of step with the text.
+    #[test]
+    fn colors_and_matches_never_lose_text() {
+        let text = "# 주석 $A\nFROM --x=\"가 $B\" a AS 나\nRUN <<E\n본문\nE\nCMD [\"다\"]\n";
+        let bounds: Vec<usize> = text.char_indices().map(|(i, _)| i).chain([text.len()]).collect();
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for _ in 0..5_000 {
+            let mut cuts: Vec<usize> = (0..next() % 8).map(|_| bounds[next() % bounds.len()]).collect();
+            cuts.sort_unstable();
+            let found: Vec<Match> = cuts.as_chunks::<2>().0.iter().map(|&[a, b]| match_at(a..b)).collect();
+            let job = layout_job(text, &options(Some(SYNTAX), &found), 100.0);
+            assert_eq!(job.text, text, "{found:?}");
+        }
+    }
+
+    #[test]
+    fn matches_a_frame_behind_keep_the_colors() {
+        let text = "# 주석";
+        let stale = [match_at(50..60)];
+        let job = layout_job(text, &options(Some(SYNTAX), &stale), 100.0);
+        assert_eq!(pieces(&job), [(text, SYNTAX.comment)]);
     }
 }

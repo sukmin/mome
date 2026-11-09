@@ -5,6 +5,31 @@ use egui::{
     Visuals,
 };
 
+use crate::dockerfile::Kind;
+
+/// Colors of Dockerfile syntax in the text area.
+#[derive(Clone, Copy)]
+pub struct SyntaxColors {
+    /// Faint, so the comments stay out of the way of the instructions.
+    pub comment: Color32,
+    pub keyword: Color32,
+    pub flag: Color32,
+    pub quoted: Color32,
+    pub variable: Color32,
+}
+
+impl SyntaxColors {
+    pub fn of(&self, kind: Kind) -> Color32 {
+        match kind {
+            Kind::Comment => self.comment,
+            Kind::Keyword => self.keyword,
+            Kind::Flag => self.flag,
+            Kind::Quoted => self.quoted,
+            Kind::Variable => self.variable,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub editor_bg: Color32,
@@ -21,6 +46,7 @@ pub struct Palette {
     pub warning: Color32,
     /// Markers on invisible characters in the text.
     pub invisible: Color32,
+    pub syntax: SyntaxColors,
 }
 
 pub const LIGHT: Palette = Palette {
@@ -36,6 +62,13 @@ pub const LIGHT: Palette = Palette {
     current_match_bg: Color32::from_rgb(0xF5, 0xB9, 0x42),
     warning: Color32::from_rgb(0xB0, 0x3A, 0x00),
     invisible: Color32::from_rgb(0xD0, 0x00, 0x70),
+    syntax: SyntaxColors {
+        comment: Color32::from_rgb(0xA0, 0xA0, 0xA0),
+        keyword: Color32::from_rgb(0x00, 0x5F, 0xB8),
+        flag: Color32::from_rgb(0x7A, 0x3E, 0x9D),
+        quoted: Color32::from_rgb(0x1E, 0x7B, 0x34),
+        variable: Color32::from_rgb(0xA0, 0x4B, 0x00),
+    },
 };
 
 pub const DARK: Palette = Palette {
@@ -51,6 +84,13 @@ pub const DARK: Palette = Palette {
     current_match_bg: Color32::from_rgb(0x9C, 0x6B, 0x00),
     warning: Color32::from_rgb(0xFF, 0xA0, 0x60),
     invisible: Color32::from_rgb(0xFF, 0x5F, 0xB0),
+    syntax: SyntaxColors {
+        comment: Color32::from_rgb(0x6A, 0x6A, 0x6A),
+        keyword: Color32::from_rgb(0x56, 0x9C, 0xD6),
+        flag: Color32::from_rgb(0xC5, 0x86, 0xC0),
+        quoted: Color32::from_rgb(0x8B, 0xC4, 0x8A),
+        variable: Color32::from_rgb(0xE0, 0xA4, 0x58),
+    },
 };
 
 pub fn palette(dark: bool) -> Palette {

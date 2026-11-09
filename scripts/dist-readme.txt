@@ -42,6 +42,10 @@ mome (모메) 텍스트 편집기 {VERSION} - 사용법
   눈에 보이지 않는 문자를 종류별로 보여 주고, 하나씩 찾아가거나 한 번에 정리합니다(Ctrl+Z로 되돌리기).
   본문에는 분홍색으로 표시되며 [보기 > 보이지 않는 문자 표시]로 끌 수 있습니다.
 
+Dockerfile 색 강조
+  Dockerfile, Dockerfile.dev, web.dockerfile, Containerfile 같은 이름의 파일을 열면
+  명령어, 옵션, 문자열, 변수를 색으로 구분하고 주석은 옅게 보여 줍니다.
+
 Windows를 끌 때
   mome를 켜 둔 채 Windows를 끄거나 다시 시작하면, 다음 로그인 때 mome가 다시 열리고
   저장하지 않은 내용까지 그대로 돌아옵니다.

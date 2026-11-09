@@ -934,6 +934,12 @@ impl MomeApp {
                     hint_border: p.accent,
                     marks: if self.settings.show_invisible { &self.invisible.marks } else { &[] },
                     mark_color: p.invisible,
+                    dockerfile: self
+                        .doc
+                        .path
+                        .as_deref()
+                        .filter(|path| crate::dockerfile::is_dockerfile(path))
+                        .map(|_| p.syntax),
                 };
                 let output = self.editor.show(ui, &mut self.doc.text, &opts);
                 if output.changed {

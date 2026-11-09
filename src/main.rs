@@ -9,6 +9,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod dockerfile;
 mod document;
 mod encoding;
 mod find;
