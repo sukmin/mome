@@ -151,9 +151,11 @@ fn reading_style(ui: &mut Ui, scale: f32) {
 /// Anything else (programs, scripts, shortcuts, installers, Office files with
 /// macros…) is only shown in Explorer, so a link in a downloaded note cannot run it.
 fn safe_to_open(path: &Path) -> bool {
+    // No SVG: it opens in the browser, where it can run scripts and fetch from
+    // other computers like a web page.
     const SAFE: &[&str] = &[
-        "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico", "tif", "tiff", "heic", "pdf", "mp3", "wav",
-        "m4a", "flac", "ogg", "aac", "mp4", "mov", "avi", "mkv", "webm",
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "heic", "pdf", "mp3", "wav", "m4a",
+        "flac", "ogg", "aac", "mp4", "mov", "avi", "mkv", "webm",
     ];
     // No alternate data streams (`a.exe:b.png`): the only ':' is the drive's.
     let colons = path.to_string_lossy().matches(':').count();
@@ -185,9 +187,11 @@ fn take_local_links(ctx: &egui::Context) -> Vec<egui::OpenUrl> {
     })
 }
 
-/// Links the reader handles itself (notes, files) rather than the browser.
+/// Links the reader decides about itself rather than leaving them to the browser:
+/// notes and files, and whatever is not plainly a web or mail address (a browser
+/// given `FILE://server/…` or `view-source:file://…` would go and open it).
 fn is_local(url: &str) -> bool {
-    url.starts_with(markdown::WIKI_SCHEME) || url.starts_with("file:") || !markdown::has_scheme(url)
+    !markdown::is_web_url(url)
 }
 
 impl MomeApp {
@@ -206,9 +210,12 @@ impl MomeApp {
             self.find.close();
         }
         if on && !self.viewer.on {
-            // Pick up edits made since the reader was last shown.
+            // Pick up edits made since the reader was last shown; what was made of
+            // the text goes too, as it says which pictures and notes were found.
             self.viewer.files.clear();
             self.viewer.forget_images = true;
+            self.viewer.prepared = None;
+            self.viewer.canvas = None;
         }
         self.viewer.on = on;
     }
@@ -288,6 +295,9 @@ impl MomeApp {
                 LinkTarget::Blocked(path) => {
                     self.notify_warning(format!("다른 컴퓨터(네트워크 경로)를 가리키는 링크라서 열지 않았습니다: {path}"));
                 }
+                LinkTarget::Unsupported(url) => {
+                    self.notify_warning(format!("웹 주소(http·https)나 메일 주소가 아닌 링크라서 열지 않았습니다: {url}"));
+                }
             }
         }
     }
@@ -298,9 +308,11 @@ impl MomeApp {
     fn open_link(&mut self, path: &Path, new_window: bool) {
         if !path.exists() {
             self.notify_warning(format!("'{}'을(를) 찾을 수 없습니다.", path.display()));
-        } else if path.is_dir() || safe_to_open(path) {
-            // A folder opens in Explorer; pictures and the like in their viewer.
+        } else if path.is_dir() {
             win::open_folder(path);
+        } else if safe_to_open(path) {
+            // Pictures and the like, in their viewer.
+            win::open_file(path);
         } else if !opens_in_mome(path) {
             win::show_in_folder(path);
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -528,6 +540,13 @@ fn load_file_card(file: &str, dir: Option<&Path>, root: Option<&Path>) -> FileCa
         let mut bytes = Vec::new();
         let read = std::fs::File::open(&path).and_then(|f| f.take(CARD_READ_LIMIT).read_to_end(&mut bytes));
         if read.is_ok() {
+            // Cut off in the middle of a character, a long UTF-8 note would be
+            // taken for ANSI and shown as garbage.
+            if let Err(cut) = std::str::from_utf8(&bytes) {
+                if cut.error_len().is_none() {
+                    bytes.truncate(cut.valid_up_to());
+                }
+            }
             let decoded = crate::encoding::decode(&bytes, None);
             let base = path.parent().map(Path::to_path_buf);
             let text = markdown::prepare(&decoded.text, base.as_deref());
@@ -667,6 +686,9 @@ mod tests {
         assert!(is_local("file:///C:/a.md"));
         assert!(!is_local("https://example.com"));
         assert!(!is_local("mailto:a@b.c"));
+        // Not for the browser, which would open the network path.
+        assert!(is_local("FILE://evil/share/a.html"));
+        assert!(is_local("view-source:file://evil/share/a"));
         assert!(opens_in_mome(Path::new("a.md")));
         assert!(!opens_in_mome(Path::new("a.pdf")));
     }
@@ -677,7 +699,7 @@ mod tests {
         assert!(safe_to_open(Path::new(r"C:\v\문서.pdf")));
         for risky in [
             "a.exe", "a.bat", "a.cmd", "a.ps1", "a.vbs", "a.js", "a.lnk", "a.url", "a.msi", "a.scr", "a.hta",
-            "a.docm", "a.exe.", "a", r"a.exe:b.png",
+            "a.docm", "a.exe.", "a", r"a.exe:b.png", "a.svg", "a.html",
         ] {
             assert!(!safe_to_open(&Path::new(r"C:\v").join(risky)), "{risky}");
         }

@@ -397,24 +397,27 @@ fn prepare_for_shutdown(hwnd: HWND, data: &HookData) {
 }
 
 /// Writes the unsaved text as a revision, or next to the session record when no
-/// temp folder has been chosen yet.
+/// temp folder has been chosen yet or it cannot be written to now (a drive that
+/// was unplugged or is full).
 fn save_text_for_restore(s: &Shared, sid: &str) -> std::io::Result<PathBuf> {
-    match s.history_root.clone() {
-        Some(root) => history::write_snapshot(&SnapshotJob {
+    if let Some(root) = s.history_root.clone() {
+        let written = history::write_snapshot(&SnapshotJob {
             root,
             key: s.record.doc_key.clone(),
             info: s.doc_info.clone(),
             kind: RevisionKind::Session,
             time: LocalTime::now(),
             text: s.text.clone(),
-        }),
-        None => {
-            let path = fallback_text_path(sid);
-            std::fs::create_dir_all(paths::sessions_dir())?;
-            crate::document::write_file_safely(&path, s.text.replace('\n', "\r\n").as_bytes())?;
-            Ok(path)
+        });
+        match written {
+            Ok(path) => return Ok(path),
+            Err(err) => log::warn!("could not write a revision at shutdown ({err}); keeping the text with the session"),
         }
     }
+    let path = fallback_text_path(sid);
+    std::fs::create_dir_all(paths::sessions_dir())?;
+    crate::document::write_file_safely(&path, s.text.replace('\n', "\r\n").as_bytes())?;
+    Ok(path)
 }
 
 fn write_record_now(record: &SessionRecord) {

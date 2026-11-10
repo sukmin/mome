@@ -22,9 +22,25 @@ impl MomeApp {
     }
 
     /// Brings back a window from a session record (Windows restart or crash recovery).
-    pub(super) fn restore_record(&mut self, ctx: &Context, record: &SessionRecord) {
+    /// Returns false if the record's unsaved text could not be read.
+    pub(super) fn restore_record(&mut self, ctx: &Context, record: &SessionRecord) -> bool {
         let (doc, warning) = doc_from_record(record);
+        // Set only when the text came from the record's revision.
+        let from_revision = record.revision.clone().filter(|_| doc.autosave_blocked);
+        let restored = !record.modified || from_revision.is_some();
         self.set_document(ctx, doc, record.cursor);
+        if let Some(revision) = from_revision {
+            // Until the next revision is written, the one the text came from is the
+            // way back to it should this window go down again first; a record
+            // without one would be thrown away as having nothing to recover.
+            let hash = self.doc.current_hash;
+            self.session.update(|s| {
+                s.record.revision = Some(revision.clone());
+                s.revision_hash = Some(hash);
+            });
+            self.sync_session(ctx);
+            self.session.write_record();
+        }
         if record.zoom > 0 {
             self.editor.zoom = record.zoom.clamp(editor::ZOOM_MIN, editor::ZOOM_MAX);
         }
@@ -32,6 +48,7 @@ impl MomeApp {
         if let Some(warning) = warning {
             self.notify_warning(warning);
         }
+        restored
     }
 
     /// "복구" in the recovery dialog: the first document goes into this window if it is
@@ -42,11 +59,13 @@ impl MomeApp {
         if pristine {
             if let Some(first) = records.next() {
                 // Read first: without a temporary save folder the text lives next to
-                // the record and goes with it.
-                self.restore_record(ctx, &first);
-                session::delete_record(&first.sid);
-                if !self.message.as_ref().is_some_and(|m| m.warning) {
-                    self.notify("저장하지 않은 문서를 복구했습니다.".to_owned());
+                // the record and goes with it. A record whose text could not be read
+                // (its drive is away for a moment) is kept, to be offered again.
+                if self.restore_record(ctx, &first) {
+                    session::delete_record(&first.sid);
+                    if !self.message.as_ref().is_some_and(|m| m.warning) {
+                        self.notify("저장하지 않은 문서를 복구했습니다.".to_owned());
+                    }
                 }
             }
         }

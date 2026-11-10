@@ -430,10 +430,21 @@ impl MomeApp {
         })
     }
 
+    /// The highlighted match is the one the bar selected last. Once the cursor or
+    /// the selection has been put elsewhere in the text, searching, replacing and
+    /// excluding go on from there, as in Notepad and IntelliJ.
+    fn forget_current_if_moved(&mut self, ctx: &egui::Context) {
+        if let Some(m) = self.find.current.and_then(|i| self.find.matches.get(i)) {
+            if m.chars != self.editor.selected_range(ctx) {
+                self.find.current = None;
+            }
+        }
+    }
+
     fn find_from_selection(&mut self, ctx: &egui::Context, direction: Direction, focus: FocusAfter) {
         self.find.refresh(&self.doc.text, self.text_version);
-        // Continue from the highlighted match; the text's own selection is only a
-        // fallback because egui forgets it while the find bar has the focus.
+        self.forget_current_if_moved(ctx);
+        // Continue from the highlighted match, passing over an empty one (`^`) there.
         let (selection, past) = match self.find.current.and_then(|i| self.find.matches.get(i)) {
             Some(m) => (m.chars.clone(), true),
             None => (self.editor.selected_range(ctx), false),
@@ -486,6 +497,7 @@ impl MomeApp {
     /// excluded match is left as it is.
     fn replace_one(&mut self, ctx: &egui::Context) {
         self.find.refresh(&self.doc.text, self.text_version);
+        self.forget_current_if_moved(ctx);
         let Some(i) = self.match_at_selection(ctx) else {
             // No match highlighted yet: first show the next one, like Notepad.
             let selection = self.editor.selected_range(ctx);
@@ -586,6 +598,7 @@ impl MomeApp {
     /// excluded match it takes it back in.
     fn exclude_one(&mut self, ctx: &egui::Context) {
         self.find.refresh(&self.doc.text, self.text_version);
+        self.forget_current_if_moved(ctx);
         let Some(i) = self.match_at_selection(ctx) else {
             let selection = self.editor.selected_range(ctx);
             self.go_to_match(selection, Direction::Forward, FocusAfter::Unchanged, false);
@@ -616,6 +629,8 @@ impl MomeApp {
         let p = self.palette();
         let ctx = ui.ctx().clone();
         self.find.refresh(&self.doc.text, self.text_version);
+        // So that the count ("3/12"), the highlight and the preview follow too.
+        self.forget_current_if_moved(&ctx);
         self.find.update_preview(&self.doc.text);
         let mut action: Option<FindAction> = self.find.pending.take();
         egui::Panel::top("mome-find-bar")

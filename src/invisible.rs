@@ -135,6 +135,27 @@ fn is_variation_selector(c: char) -> bool {
     matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
+/// The flags of England, Scotland and Wales are a black flag (U+1F3F4) followed by
+/// tag characters spelling the region and a cancel tag: emoji like any other, and
+/// the only such sequences in use. Returns how many characters after the black
+/// flag belong to one of them at the start of `rest`.
+fn flag_tags(rest: &str) -> usize {
+    const REGIONS: [&str; 3] = ["gbeng", "gbsct", "gbwls"];
+    let mut tags = rest.chars().map(|c| c as u32);
+    let region: String = tags
+        .by_ref()
+        .take(5)
+        .filter_map(|code| code.checked_sub(0xE0000).and_then(|c| u8::try_from(c).ok()).map(char::from))
+        .collect();
+    if REGIONS.contains(&region.as_str()) && tags.next() == Some(0xE007F) {
+        6
+    } else {
+        0
+    }
+}
+
+const BLACK_FLAG: char = '\u{1F3F4}';
+
 /// One invisible character in a text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Found {
@@ -150,9 +171,14 @@ pub struct Found {
 pub fn scan(text: &str) -> Vec<Found> {
     let mut found = Vec::new();
     let mut prev = None;
+    let mut flag = 0; // Characters left of a region flag's tags.
     for (at, (byte, ch)) in text.char_indices().enumerate() {
-        if let Some(kind) = classify(ch, prev) {
+        if flag > 0 {
+            flag -= 1;
+        } else if let Some(kind) = classify(ch, prev) {
             found.push(Found { at, byte, ch, kind });
+        } else if ch == BLACK_FLAG {
+            flag = flag_tags(&text[byte + ch.len_utf8()..]);
         }
         prev = Some(ch);
     }
@@ -186,8 +212,16 @@ pub fn hidden_messages(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut tag = (0, String::new());
     let mut bytes = (0, Vec::new());
+    let mut flag = 0; // Characters left of a region flag's tags.
     // A NUL at the end flushes the last run.
-    for (i, c) in text.chars().chain(std::iter::once('\0')).enumerate() {
+    for (i, (byte, c)) in text.char_indices().chain(std::iter::once((text.len(), '\0'))).enumerate() {
+        if flag > 0 {
+            flag -= 1;
+            continue;
+        }
+        if c == BLACK_FLAG {
+            flag = flag_tags(&text[byte + c.len_utf8()..]);
+        }
         let code = c as u32;
         if (0xE0020..=0xE007E).contains(&code) {
             if tag.1.is_empty() {
@@ -256,6 +290,36 @@ mod tests {
         assert!(scan("👨\u{200D}👩\u{200D}👧 ❤\u{FE0F}\u{200D}🔥").is_empty());
         assert_eq!(scan("가\u{200D}나").len(), 1);
         assert_eq!(scan("a\u{E0100}\u{E0101}").len(), 1);
+    }
+
+    fn tags(text: &str) -> String {
+        text.chars().map(|c| char::from_u32(0xE0000 + c as u32).unwrap()).collect()
+    }
+
+    #[test]
+    fn region_flags_are_emoji() {
+        for region in ["gbeng", "gbsct", "gbwls"] {
+            let flag = format!("가{BLACK_FLAG}{}\u{E007F}나\u{200B}", tags(region));
+            let found = scan(&flag);
+            assert_eq!(found.len(), 1, "{region}");
+            assert_eq!((found[0].at, found[0].ch), (9, '\u{200B}'));
+            assert!(hidden_messages(&flag).is_empty(), "{region}");
+        }
+        // Anything else after a black flag is still hidden text, and so are the
+        // same tags without the flag, without their end, or with more after it.
+        for text in [
+            format!("{BLACK_FLAG}{}\u{E007F}", tags("hello")),
+            format!("{BLACK_FLAG}{}", tags("gbeng")),
+            format!("깃발{}\u{E007F}", tags("gbeng")),
+            format!("{BLACK_FLAG}{}", tags("gbengland")),
+        ] {
+            assert!(scan(&text).len() >= 5, "{text:?}");
+            assert_eq!(hidden_messages(&text).len(), 1, "{text:?}");
+        }
+        // After a real flag, hiding starts again.
+        let after = format!("{BLACK_FLAG}{}\u{E007F}{}", tags("gbsct"), tags("hi"));
+        assert_eq!(scan(&after).len(), 2);
+        assert_eq!(hidden_messages(&after), [(7, "hi".to_owned())]);
     }
 
     #[test]

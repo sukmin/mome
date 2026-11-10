@@ -266,10 +266,17 @@ pub fn write_snapshot(job: &SnapshotJob) -> std::io::Result<PathBuf> {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 use std::io::Write as _;
-                file.write_all(body.as_bytes())?;
                 // Revisions exist to survive crashes and power cuts: make sure it is on disk.
-                file.sync_all()?;
-                return Ok(path);
+                let written = file.write_all(body.as_bytes()).and_then(|()| crate::document::sync(&file));
+                drop(file);
+                return match written {
+                    Ok(()) => Ok(path),
+                    Err(err) => {
+                        // Half a revision (full disk) must not pass for the latest one.
+                        let _ = std::fs::remove_file(&path);
+                        Err(err)
+                    }
+                };
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Same millisecond as an earlier revision: never overwrite, bump instead.

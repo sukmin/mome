@@ -24,9 +24,17 @@ fn write_all_synced(mut file: std::fs::File, bytes: &[u8]) -> std::io::Result<()
     sync(&file)
 }
 
+/// Whether `err`, from reading `path`, means that the file is gone: its folder is
+/// there and the file is not. A drive or a server that is not connected is
+/// reported as "not found" as well, and that says nothing about the file.
+pub fn is_missing_file(path: &Path, err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound
+        && path.parent().is_some_and(|dir| dir.as_os_str().is_empty() || dir.is_dir())
+}
+
 /// Flushes `file` to the disk. Drives that cannot flush (some network and virtual
 /// drives answer "invalid function" or "not supported") have taken the data anyway.
-fn sync(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn sync(file: &std::fs::File) -> std::io::Result<()> {
     const ERROR_INVALID_FUNCTION: i32 = 1;
     const ERROR_NOT_SUPPORTED: i32 = 50;
     match file.sync_all() {
@@ -265,12 +273,12 @@ impl Document {
     }
 
     /// Loads `path`, or starts an empty document for it if the file is gone. A file
-    /// that is there but cannot be read now gives an empty document marked
-    /// [`Self::unread`], and a warning for the user.
+    /// that cannot be read now (it is locked, or its drive is not connected) gives
+    /// an empty document marked [`Self::unread`], and a warning for the user.
     pub fn load_or_new(path: &Path, forced: Option<Encoding>) -> (Self, Option<String>) {
         match Self::load(path, forced) {
             Ok((doc, _)) => (doc, None),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Self::new_at(path), None),
+            Err(err) if is_missing_file(path, &err) => (Self::new_at(path), None),
             Err(err) => {
                 log::warn!("cannot read {}: {err}", path.display());
                 let mut doc = Self::new_at(path);
@@ -418,6 +426,22 @@ mod tests {
         let (doc, warning) = Document::load_or_new(&dir.join("폴더.txt"), None);
         assert!(doc.unread && warning.is_some());
         assert!(doc.text.is_empty());
+        // Nowhere to be found, folder and all, as on a drive that is not connected:
+        // the file may well be there, so this is no new document either.
+        let (doc, warning) = Document::load_or_new(&dir.join("없는 폴더").join("메모.txt"), None);
+        assert!(doc.unread && warning.is_some());
+        assert_eq!(doc.disk_stamp.map(|s| s.len), Some(u64::MAX));
+        let unknown_drive = (b'D'..=b'Z')
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .find(|root| !root.exists());
+        if let Some(root) = unknown_drive {
+            let (doc, warning) = Document::load_or_new(&root.join("메모.txt"), None);
+            assert!(doc.unread && warning.is_some(), "{}", root.display());
+        }
+        // A bare file name is looked for in the current folder, which is there.
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(is_missing_file(Path::new("새 파일.txt"), &missing));
+        assert!(!is_missing_file(Path::new("새 파일.txt"), &std::io::Error::other("잠김")));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

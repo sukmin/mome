@@ -88,7 +88,9 @@ pub fn prepare(text: &str, base_dir: Option<&Path>) -> String {
                 fence = None;
             } else {
                 out.push_str(line);
-                if f.closed_by(content) {
+                // A quoted line (`> ```) cannot close a block opened outside a quote.
+                let closing = if f.quoted { content } else { line.trim_start_matches([' ', '\t']) };
+                if f.closed_by(closing) {
                     fence = None;
                 }
                 continue;
@@ -346,9 +348,10 @@ fn escape_into(s: &str, out: &mut String) {
     }
 }
 
-/// `file:///C:/dir/a%25b.png`: only `%` is encoded, matching [`LocalFileLoader`].
+/// `file:///C:/dir/a%25b.png`: only `%` and `#` are encoded (a `#` would cut the
+/// path short as the start of a fragment), matching [`LocalFileLoader`].
 pub fn file_uri(path: &Path) -> String {
-    let p = path.to_string_lossy().replace('\\', "/").replace('%', "%25");
+    let p = path.to_string_lossy().replace('\\', "/").replace('%', "%25").replace('#', "%23");
     if let Some(unc) = p.strip_prefix("//?/UNC/") {
         return format!("file://{unc}");
     }
@@ -473,6 +476,11 @@ fn search(root: &Path, wanted: &[String]) -> Option<PathBuf> {
 /// `None` for paths on this PC.
 pub fn network_share(path: &Path) -> Option<String> {
     let s = path.to_string_lossy().replace('/', "\\");
+    // `\??\` is how Windows itself spells `\\?\`, and it takes it from programs too.
+    let s = match s.strip_prefix(r"\??\") {
+        Some(rest) => format!(r"\\?\{rest}"),
+        None => s,
+    };
     let rest = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         rest
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -512,6 +520,27 @@ pub enum LinkTarget {
     Anchor,
     /// A network path on another server, which links may not open.
     Blocked(String),
+    /// A URL that is neither a web nor a mail address (`view-source:`, `search-ms:`
+    /// and the like), which is not handed to the browser.
+    Unsupported(String),
+}
+
+/// What is left of `url` after its scheme (`file`, in any case) and the colon.
+fn after_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+    let (bytes, len) = (url.as_bytes(), scheme.len());
+    // The colon being there makes both sides of it character boundaries.
+    let named = bytes.get(len) == Some(&b':') && bytes[..len].eq_ignore_ascii_case(scheme.as_bytes());
+    named.then(|| &url[len + 1..])
+}
+
+/// `file:` URIs, however the scheme is capitalized.
+pub fn is_file_uri(url: &str) -> bool {
+    after_scheme(url, "file").is_some()
+}
+
+/// Web and mail addresses: the links that go to the browser.
+pub fn is_web_url(url: &str) -> bool {
+    ["http", "https", "mailto"].iter().any(|scheme| after_scheme(url, scheme).is_some())
 }
 
 /// Resolves a link clicked in a note in `dir` (`None` for untitled text).
@@ -525,7 +554,7 @@ pub fn resolve_link(url: &str, dir: Option<&Path>) -> LinkTarget {
     if url.starts_with('#') {
         return LinkTarget::Anchor;
     }
-    if url.starts_with("file:") {
+    if is_file_uri(url) {
         let path = file_uri_path(url);
         return if may_read(&path, dir) {
             LinkTarget::File(path)
@@ -534,7 +563,11 @@ pub fn resolve_link(url: &str, dir: Option<&Path>) -> LinkTarget {
         };
     }
     if has_scheme(url) {
-        return LinkTarget::Url(url.to_owned());
+        return if is_web_url(url) {
+            LinkTarget::Url(url.to_owned())
+        } else {
+            LinkTarget::Unsupported(url.to_owned())
+        };
     }
     let path = percent_decode(url.split('#').next().unwrap_or(url));
     if path.is_empty() {
@@ -559,7 +592,7 @@ pub fn resolve_link(url: &str, dir: Option<&Path>) -> LinkTarget {
 /// The path in a `file:` URI: `file:///C:/a%20b.md#x` → `C:/a b.md`, and
 /// `file://server/share/x` → `\\server\share\x`.
 fn file_uri_path(uri: &str) -> PathBuf {
-    let rest = uri.strip_prefix("file:").unwrap_or(uri);
+    let rest = after_scheme(uri, "file").unwrap_or(uri);
     let rest = rest.split('#').next().unwrap_or(rest);
     match rest.strip_prefix("///") {
         Some(local) => PathBuf::from(percent_decode(local)),
@@ -634,7 +667,7 @@ impl BytesLoader for LocalFileLoader {
     }
 
     fn load(&self, _ctx: &egui::Context, uri: &str) -> BytesLoadResult {
-        if !uri.starts_with("file:") {
+        if !is_file_uri(uri) {
             return Err(LoadError::NotSupported);
         }
         let path = file_uri_path(uri);
@@ -691,6 +724,15 @@ mod tests {
             prepare(text, None),
             "`[[a]]` [b](<wiki:b>)\n```\n[[c]] %%x%%\n```\n 보임"
         );
+    }
+
+    #[test]
+    fn quoted_fence_does_not_close_an_unquoted_block() {
+        // A note showing how to put code in a callout: the `> ``` lines are code.
+        let text = "```md\n> ```js\n> [[x]]\n> ```\n[[y]]\n```\n[[z]] 뒤\n";
+        assert_eq!(prepare(text, None), "```md\n> ```js\n> [[x]]\n> ```\n[[y]]\n```\n[z](<wiki:z>) 뒤\n");
+        // Indented closing fences still close.
+        assert_eq!(prepare("```\n[[a]]\n  ```\n[[b]]", None), "```\n[[a]]\n  ```\n[b](<wiki:b>)");
     }
 
     #[test]
@@ -753,6 +795,23 @@ mod tests {
             LinkTarget::File(PathBuf::from("C:/a.md"))
         );
         assert_eq!(file_uri(Path::new(r"\\?\UNC\srv\share\x.png")), "file://srv/share/x.png");
+        // A `#` in a folder name is no fragment: the path comes back whole.
+        let sharp = file_uri(Path::new(r"C:\C# 노트\#inbox\그림.png"));
+        assert_eq!(sharp, "file:///C:/C%23 노트/%23inbox/그림.png");
+        assert_eq!(resolve_link(&sharp, None), LinkTarget::File(PathBuf::from("C:/C# 노트/#inbox/그림.png")));
+        assert_eq!(
+            resolve_link(&format!("{}img/a.png", base_uri(Path::new(r"C:\C# 노트"))), None),
+            LinkTarget::File(PathBuf::from("C:/C# 노트/img/a.png"))
+        );
+        // Only web and mail addresses are for the browser, whatever their case.
+        assert_eq!(resolve_link("HTTPS://x.kr", None), LinkTarget::Url("HTTPS://x.kr".into()));
+        for url in ["view-source:file://evil/share/a", "search-ms:query=x", "ms-msdt:/id x", "javascript:alert(1)"] {
+            assert_eq!(resolve_link(url, None), LinkTarget::Unsupported(url.into()), "{url}");
+        }
+        assert!(is_file_uri("File:///C:/a") && !is_file_uri("files:x") && !is_file_uri("file") && !is_file_uri("한글:"));
+        for plain in ["다른 노트.md", "가나다라마", "", "h", "http", "가:나"] {
+            assert!(!is_web_url(plain) && !is_file_uri(plain), "{plain}");
+        }
     }
 
     #[test]
@@ -763,6 +822,11 @@ mod tests {
         assert_eq!(network_share(Path::new("//srv/share/a")).as_deref(), Some(r"\\srv\share"));
         assert_eq!(network_share(Path::new(r"\\?\UNC\srv\share\a")).as_deref(), Some(r"\\srv\share"));
         assert!(network_share(Path::new(r"\\.\pipe\x")).is_some());
+        // The NT spelling of `\\?\`.
+        assert_eq!(network_share(Path::new(r"\??\C:\a")), None);
+        assert_eq!(network_share(Path::new(r"\??\UNC\Evil\share\a")).as_deref(), Some(r"\\evil\share"));
+        assert_eq!(network_share(Path::new("/??/UNC/evil/share/a")).as_deref(), Some(r"\\evil\share"));
+        assert!(network_share(Path::new(r"\??\GLOBALROOT\Device\Mup\evil\share")).is_some());
 
         let local = Some(Path::new(r"C:\notes"));
         let shared = Some(Path::new(r"\\srv\share\notes"));
@@ -771,6 +835,11 @@ mod tests {
         assert!(!may_read(Path::new(r"\\evil\x\img.png"), shared));
 
         assert!(matches!(resolve_link("file://evil/share/a.md", local), LinkTarget::Blocked(_)));
+        assert!(matches!(resolve_link("FILE://evil/share/a.md", local), LinkTarget::Blocked(_)));
+        assert!(matches!(resolve_link("file:///%5C??%5CUNC%5Cevil%5Cshare%5Cx.png", local), LinkTarget::Blocked(_)));
+        assert!(matches!(resolve_link("file:////??/UNC/evil/share/x.png", local), LinkTarget::Blocked(_)));
+        // Written as a plain path it is looked for under the note's drive, and is not there.
+        assert!(matches!(resolve_link(r"\??\UNC\evil\share\a.md", local), LinkTarget::Missing(_)));
         assert!(matches!(resolve_link("//evil/share/a.md", local), LinkTarget::Blocked(_)));
         assert!(!is_relative_name(r"\\evil\share\a.png"));
         assert!(!is_relative_name("C:/a.png"));

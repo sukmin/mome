@@ -93,8 +93,15 @@ impl Canvas {
 }
 
 impl Node {
+    /// Where the card is. Kept within what can be drawn: a card written to be at
+    /// 1e30 would make the curve of an edge to it take forever to work out.
     pub fn rect(&self) -> Rect {
-        Rect::from_min_size(Pos2::new(self.x, self.y), Vec2::new(self.width.max(1.0), self.height.max(1.0)))
+        const FAR: f32 = 1.0e7;
+        const BIG: f32 = 1.0e6;
+        Rect::from_min_size(
+            Pos2::new(self.x.clamp(-FAR, FAR), self.y.clamp(-FAR, FAR)),
+            Vec2::new(self.width.clamp(1.0, BIG), self.height.clamp(1.0, BIG)),
+        )
     }
 
     pub fn is_group(&self) -> bool {
@@ -195,6 +202,19 @@ mod tests {
             {"id": "f", "fromNode": "a", "fromSide": "bottom", "toNode": "c", "toSide": "top", "label": "참고"}
         ]
     }"##;
+
+    #[test]
+    fn far_away_cards_stay_drawable() {
+        let text = r#"{"nodes": [
+            {"id": "a", "type": "text", "text": "x", "x": 0, "y": 0, "width": 100, "height": 100},
+            {"id": "b", "type": "text", "text": "y", "x": 1e30, "y": -1e39, "width": 1e20, "height": -5}
+        ], "edges": [{"fromNode": "a", "toNode": "b"}]}"#;
+        let canvas = Canvas::parse(text).unwrap();
+        let far = canvas.nodes[1].rect();
+        assert_eq!(far.min, Pos2::new(1.0e7, -1.0e7));
+        assert_eq!(far.size(), Vec2::new(1.0e6, 1.0));
+        assert!(canvas.bounds().is_some_and(|b| b.is_finite()));
+    }
 
     #[test]
     fn parses_sample() {

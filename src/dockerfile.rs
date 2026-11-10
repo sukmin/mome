@@ -342,6 +342,8 @@ impl Scanner<'_> {
         if instruction.in_flags && word.starts_with("--") {
             let stop = word.find('=').map_or(word_end, |eq| at + eq + 1);
             self.push(at..stop, Kind::Flag);
+            // A bare `--` ends the flags: what follows belongs to the command.
+            instruction.in_flags = word != "--";
             return stop; // The value is read like any other text.
         }
         instruction.in_flags = false;
@@ -481,6 +483,10 @@ mod tests {
         assert_eq!(
             parts("RUN --mount=type=cache,target=$DIR make"),
             [("RUN", Keyword), ("--mount=", Flag), ("$DIR", Variable)]
+        );
+        assert_eq!(
+            parts("RUN --network=none -- --version --x"),
+            [("RUN", Keyword), ("--network=", Flag), ("--", Flag)]
         );
     }
 

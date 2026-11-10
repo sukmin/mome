@@ -201,11 +201,8 @@ impl MomeApp {
             self.editor.request_focus();
         }
         // Ctrl + mouse wheel zooms the text (the canvas zooms itself).
-        let zoom = if self.reading() == Some(ViewKind::Canvas) { 1.0 } else { ctx.input(|i| i.zoom_delta()) };
-        if zoom > 1.0 {
-            self.editor.zoom_by(1);
-        } else if zoom < 1.0 {
-            self.editor.zoom_by(-1);
+        if self.reading() != Some(ViewKind::Canvas) {
+            self.editor.zoom_by_factor(ctx.input(|i| i.zoom_delta()));
         }
     }
 
@@ -403,13 +400,12 @@ impl MomeApp {
             Err(err) => {
                 let at = crate::json::error_char_index(&self.doc.text, err.line(), err.column());
                 self.editor.select(at, at);
+                // As the status bar counts: serde_json's column is in bytes, which
+                // is further right than the characters once there is Korean before it.
+                let (line, column) = self.stats.line_col(at);
                 self.show_error(
                     "JSON을 정리할 수 없습니다",
-                    &format!(
-                        "{}줄 {}열 근처의 JSON 형식이 올바르지 않습니다. 커서를 그 위치로 옮겼습니다.",
-                        err.line(),
-                        err.column()
-                    ),
+                    &format!("{line}줄 {column}열 근처의 JSON 형식이 올바르지 않습니다. 커서를 그 위치로 옮겼습니다."),
                 );
             }
         }

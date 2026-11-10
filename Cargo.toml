@@ -1,6 +1,6 @@
 [package]
 name = "mome"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "mome - a lightweight text editor for Windows 11"
 build = "build.rs"

@@ -13,9 +13,8 @@ use crate::invisible::{self, Found, Kind};
 struct Group {
     kind: Kind,
     count: usize,
-    /// A few of the distinct characters, for their code points.
+    /// The distinct characters, in the order met; the first few are listed by code point.
     chars: Vec<char>,
-    distinct: usize,
 }
 
 #[derive(Default)]
@@ -50,18 +49,15 @@ impl InvisibleState {
             match self.groups.iter_mut().find(|g| g.kind.name == f.kind.name) {
                 Some(g) => {
                     g.count += 1;
+                    // A kind has a few hundred characters at most.
                     if !g.chars.contains(&f.ch) {
-                        g.distinct += 1;
-                        if g.chars.len() < SHOWN_CODES {
-                            g.chars.push(f.ch);
-                        }
+                        g.chars.push(f.ch);
                     }
                 }
                 None => self.groups.push(Group {
                     kind: f.kind,
                     count: 1,
                     chars: vec![f.ch],
-                    distinct: 1,
                 }),
             }
         }
@@ -101,10 +97,11 @@ enum Action {
 
 /// `U+200B` or `U+202A, U+202E 외 3종`.
 fn codes(group: &Group) -> String {
-    let list: Vec<String> = group.chars.iter().map(|c| format!("U+{:04X}", *c as u32)).collect();
+    let shown = group.chars.iter().take(SHOWN_CODES);
+    let list: Vec<String> = shown.map(|c| format!("U+{:04X}", *c as u32)).collect();
     let mut s = list.join(", ");
-    if group.distinct > group.chars.len() {
-        s.push_str(&format!(" 외 {}종", group.distinct - group.chars.len()));
+    if group.chars.len() > SHOWN_CODES {
+        s.push_str(&format!(" 외 {}종", group.chars.len() - SHOWN_CODES));
     }
     s
 }
@@ -315,6 +312,10 @@ mod tests {
         assert_eq!(codes(&state.groups[0]), "U+200B");
         assert_eq!(codes(&state.groups[1]), "U+202A, U+202E, U+2066 외 2종");
         assert!(!state.picked(&state.groups[2].kind));
+        // Characters met again past the listed ones are not counted again.
+        let mut repeated = InvisibleState::default();
+        repeated.refresh(&"\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}".repeat(3), 1);
+        assert_eq!(codes(&repeated.groups[0]), "U+202A, U+202B, U+202C 외 2종");
         // Same version: not scanned again.
         state.refresh("", 1);
         assert_eq!(state.found.len(), 8);

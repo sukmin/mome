@@ -54,10 +54,34 @@ pub unsafe fn remove_subclass<T>(hwnd: HWND, proc: SUBCLASSPROC, id: usize, data
     }
 }
 
-/// Opens a folder in Explorer.
+/// `path` for the shell: with `\` only, and for a folder with one at the end.
+fn shell_path(path: &Path, folder: bool) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let (slash, backslash) = (u16::from(b'/'), u16::from(b'\\'));
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().map(|c| if c == slash { backslash } else { c }).collect();
+    if folder && wide.last() != Some(&backslash) {
+        wide.push(backslash);
+    }
+    wide.push(0);
+    wide
+}
+
+/// Opens a folder in Explorer. Asked to "open" `C:\노트\자료`, the shell runs a
+/// `자료.bat` or `자료.exe` lying next to the folder instead of opening it; the
+/// `\` at the end and the "explore" verb, which programs do not have, leave
+/// nothing but the folder.
 pub fn open_folder(path: &Path) {
-    let verb = wide("open");
-    let target = wide_path(path);
+    shell_execute("explore", &shell_path(path, true));
+}
+
+/// Opens a file with the program Windows has for it. Only for files that have
+/// been found safe to hand over.
+pub fn open_file(path: &Path) {
+    shell_execute("open", &shell_path(path, false));
+}
+
+fn shell_execute(verb: &str, target: &[u16]) {
+    let verb = wide(verb);
     unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
@@ -75,7 +99,8 @@ pub fn open_folder(path: &Path) {
 pub fn show_in_folder(path: &Path) {
     use std::os::windows::process::CommandExt;
     // Explorer wants `/select,"path"` as one raw argument; paths cannot contain quotes.
-    let arg = format!("/select,\"{}\"", path.display());
+    // It does not know `/` (as in a link to `sub/a.exe`) and would show another folder.
+    let arg = format!("/select,\"{}\"", path.display().to_string().replace('/', "\\"));
     if let Err(err) = std::process::Command::new("explorer.exe").raw_arg(arg).spawn() {
         log::error!("could not start Explorer: {err}");
     }
@@ -90,5 +115,18 @@ pub fn spawn_self(args: &[&std::ffi::OsStr]) {
             }
         }
         Err(err) => log::error!("could not find our own executable: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folders_end_in_a_backslash_for_the_shell() {
+        let text = |wide: Vec<u16>| String::from_utf16(&wide).unwrap();
+        assert_eq!(text(shell_path(Path::new(r"C:\노트/자료"), true)), "C:\\노트\\자료\\\0");
+        assert_eq!(text(shell_path(Path::new(r"C:\노트\자료\"), true)), "C:\\노트\\자료\\\0");
+        assert_eq!(text(shell_path(Path::new("C:/노트/그림.png"), false)), "C:\\노트\\그림.png\0");
     }
 }

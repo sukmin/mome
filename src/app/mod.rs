@@ -371,15 +371,20 @@ impl MomeApp {
                 }
                 true
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound && encoding.is_none() => {
+            Err(err) if encoding.is_none() && crate::document::is_missing_file(path, &err) => {
                 // Like Notepad: `mome.exe new.txt` starts a new file with that name.
+                // Not on a drive that is not connected: the file may be there, and
+                // saving the "new" one later would replace it.
                 self.set_document(ctx, Document::new_at(path), 0);
                 self.notify("새 파일입니다. 저장하면 파일이 만들어집니다.".to_owned());
                 true
             }
             Err(err) => {
                 self.show_error("파일을 열 수 없습니다", &format!("{}\n\n{err}", path.display()));
-                self.change_settings(|s| s.recent_files.retain(|p| p != path));
+                // A file whose drive is not connected now stays in the list.
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    self.change_settings(|s| s.recent_files.retain(|p| p != path));
+                }
                 false
             }
         }
@@ -459,7 +464,13 @@ impl MomeApp {
     }
 
     fn save_to(&mut self, ctx: &egui::Context, path: &Path, after: Option<After>) -> bool {
-        if (self.doc.lossy || self.doc.unread) && self.doc.path.as_deref() == Some(path) {
+        self.save_to_confirmed(ctx, path, after, false)
+    }
+
+    /// `lossy_ok`: the user has agreed to saving over a file whose bytes could not
+    /// all be read. The document keeps saying so until it has really been written.
+    fn save_to_confirmed(&mut self, ctx: &egui::Context, path: &Path, after: Option<After>, lossy_ok: bool) -> bool {
+        if !lossy_ok && (self.doc.lossy || self.doc.unread) && self.doc.path.as_deref() == Some(path) {
             // Saving would replace bytes we could not read with '�', or a file we
             // could not read at all.
             self.open_dialog(Dialog::LossySave {
@@ -475,6 +486,7 @@ impl MomeApp {
                     sample: unrepresentable.sample,
                     path: path.to_path_buf(),
                     after,
+                    lossy_ok,
                 });
                 return false;
             }

@@ -38,7 +38,8 @@ pub enum Dialog {
     Message { title: String, body: String },
     Reload,
     Recover { records: Vec<SessionRecord> },
-    EncodingFallback { sample: char, path: PathBuf, after: Option<After> },
+    /// `lossy_ok`: [`Dialog::LossySave`] was already answered with "save anyway".
+    EncodingFallback { sample: char, path: PathBuf, after: Option<After>, lossy_ok: bool },
     /// Saving over a file that had bytes we could not read.
     LossySave { path: PathBuf, after: Option<After> },
     Shortcuts,
@@ -709,20 +710,20 @@ impl MomeApp {
                 self.close_dialog();
             }
             Outcome::SaveAsUtf8 => {
-                if let Dialog::EncodingFallback { path, after, .. } = dialog {
+                if let Dialog::EncodingFallback { path, after, lossy_ok, .. } = dialog {
                     self.close_dialog();
                     self.doc.encoding = Encoding::Utf8;
-                    self.save_to(ctx, &path, after);
+                    self.save_to_confirmed(ctx, &path, after, lossy_ok);
                 }
             }
             Outcome::SaveLossy => {
                 if let Dialog::LossySave { path, after } = dialog {
                     self.close_dialog();
                     // The user accepted that unreadable bytes become '�' (or that
-                    // the unread file is replaced).
-                    self.doc.lossy = false;
-                    self.doc.unread = false;
-                    self.save_to(ctx, &path, after);
+                    // the unread file is replaced). The document stays marked until
+                    // the file is written: if that fails or is called off, the next
+                    // save asks again and autosave keeps its hands off.
+                    self.save_to_confirmed(ctx, &path, after, true);
                 }
             }
         }

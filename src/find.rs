@@ -539,28 +539,34 @@ fn find_from(text: &str, from: usize, query: &str, opts: FindOptions) -> (Vec<Ma
         return (Vec::new(), None);
     }
     let rest = &text[from..];
+    // A candidate that is part of a longer word must not hide a whole word that
+    // starts inside it (`1.1` in `v1.1.1`), so with whole words they may overlap.
+    let overlapping = opts.whole_word;
     let byte_matches = if opts.match_case {
-        rest.match_indices(query)
-            .take(MAX_CANDIDATES)
-            .map(|(start, m)| start..start + m.len())
-            .collect::<Vec<_>>()
+        find_exact(rest, query, overlapping)
     } else if query.is_ascii() {
-        find_ascii_case_insensitive(rest, query)
+        find_ascii_case_insensitive(rest, query, overlapping)
     } else {
-        find_folded(rest, query)
+        find_folded(rest, query, overlapping)
     };
     // The candidate list itself may have been cut short.
     let candidates_cut = byte_matches.len() >= MAX_CANDIDATES;
-    let last_candidate = byte_matches.last().map(|b| b.end + from);
+    // Where the search goes on after the candidates looked at so far.
+    let mut resume = from;
 
     let mut out = Vec::new();
     let mut char_pos = text[..from].chars().count();
     let mut byte_pos = from;
     for bytes in byte_matches {
         let bytes = bytes.start + from..bytes.end + from;
+        if bytes.start < byte_pos {
+            continue; // Overlaps the match before it.
+        }
         if opts.whole_word && !is_whole_word(text, &bytes) {
+            resume = next_char(text, bytes.start);
             continue;
         }
+        resume = bytes.end;
         char_pos += text[byte_pos..bytes.start].chars().count();
         let len = text[bytes.clone()].chars().count();
         out.push(Match {
@@ -574,11 +580,35 @@ fn find_from(text: &str, from: usize, query: &str, opts: FindOptions) -> (Vec<Ma
             return (out, Some(bytes.end));
         }
     }
-    let more = if candidates_cut { last_candidate } else { None };
+    let more = candidates_cut.then_some(resume);
     (out, more)
 }
+
+/// Where `query` is in `text`, at most [`MAX_CANDIDATES`] places: one after the
+/// other, or with `overlapping` every place it starts at.
+fn find_exact(text: &str, query: &str, overlapping: bool) -> Vec<Range<usize>> {
+    if !overlapping {
+        return text
+            .match_indices(query)
+            .take(MAX_CANDIDATES)
+            .map(|(start, m)| start..start + m.len())
+            .collect();
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(found) = text[at..].find(query) {
+        let start = at + found;
+        out.push(start..start + query.len());
+        if out.len() >= MAX_CANDIDATES {
+            break;
+        }
+        at = next_char(text, start);
+    }
+    out
+}
+
 /// Byte-wise search; an ASCII needle can only match ASCII bytes, so this is exact.
-fn find_ascii_case_insensitive(text: &str, query: &str) -> Vec<Range<usize>> {
+fn find_ascii_case_insensitive(text: &str, query: &str, overlapping: bool) -> Vec<Range<usize>> {
     let hay = text.as_bytes();
     let needle: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
     let mut out = Vec::new();
@@ -591,7 +621,7 @@ fn find_ascii_case_insensitive(text: &str, query: &str) -> Vec<Range<usize>> {
                 .all(|(a, b)| a.to_ascii_lowercase() == *b)
         {
             out.push(i..i + needle.len());
-            i += needle.len();
+            i += if overlapping { 1 } else { needle.len() };
             if out.len() >= MAX_CANDIDATES {
                 break;
             }
@@ -602,7 +632,7 @@ fn find_ascii_case_insensitive(text: &str, query: &str) -> Vec<Range<usize>> {
     out
 }
 
-fn find_folded(text: &str, query: &str) -> Vec<Range<usize>> {
+fn find_folded(text: &str, query: &str, overlapping: bool) -> Vec<Range<usize>> {
     let needle: Vec<char> = query.chars().map(fold).collect();
     let hay: Vec<(usize, char)> = text.char_indices().map(|(i, c)| (i, fold(c))).collect();
     let mut out = Vec::new();
@@ -616,7 +646,7 @@ fn find_folded(text: &str, query: &str) -> Vec<Range<usize>> {
             let start = hay[i].0;
             let end = hay.get(i + needle.len()).map_or(text.len(), |(b, _)| *b);
             out.push(start..end);
-            i += needle.len();
+            i += if overlapping { 1 } else { needle.len() };
             if out.len() >= MAX_CANDIDATES {
                 break;
             }
@@ -687,6 +717,26 @@ mod tests {
         assert_eq!(starts(&find_all(text, "apple", ww)), vec![0, 6]);
         assert_eq!(starts(&find_all(text, "사과", ci)), vec![12, 24]);
         assert_eq!(starts(&find_all(text, "사과", ww)), vec![12]);
+    }
+
+    /// A candidate that is no whole word must not hide one that starts inside it,
+    /// whichever of the three searches is used (and as the regex search does).
+    #[test]
+    fn whole_words_inside_rejected_candidates() {
+        let ci = FindOptions { whole_word: true, ..Default::default() };
+        let cs = FindOptions { match_case: true, ..ci };
+        for opts in [ci, cs] {
+            assert_eq!(starts(&find_all("v1.1.1", "1.1", opts)), vec![3], "{opts:?}");
+            assert_eq!(starts(&find_all("나가 가 가", "가 가", opts)), vec![3], "{opts:?}");
+            // Accepted matches still do not overlap each other.
+            assert_eq!(starts(&find_all("a.a.a.a", "a.a", opts)), vec![0, 4], "{opts:?}");
+            assert_eq!(starts(&find_every("xa a a a", "a a", opts)), vec![3], "{opts:?}");
+        }
+        assert_eq!(starts(&find_all("xÄ.ä.Ä", "ä.ä", ci)), vec![3]);
+        // Without whole words nothing changes: matches follow one another.
+        assert_eq!(starts(&find_all("aaaa", "aa", FindOptions::default())), vec![0, 2]);
+        let m = &find_all("가v1.1.1", "1.1", ci)[0];
+        assert_eq!((m.chars.clone(), m.bytes.clone()), (4..7, 6..9));
     }
 
     #[test]

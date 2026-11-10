@@ -174,12 +174,28 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+        Self::read(path).unwrap_or_else(|err| {
+            log::warn!("cannot read settings {} now: {err}", path.display());
+            Self::default()
+        })
+    }
+
+    /// The settings in `path`; the defaults if there is no such file or it makes no
+    /// sense. An error means the file is there but could not be read now (another
+    /// program holds it, say), so nothing is known about what it says.
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err),
         };
-        // Tolerate a BOM in case the file was edited by hand.
-        let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
-        match serde_json::from_str::<Settings>(text) {
+        // Not UTF-8 (saved by hand as UTF-16 or ANSI) is as unreadable as bad JSON.
+        let parsed = String::from_utf8(bytes).map_err(|err| err.to_string()).and_then(|text| {
+            // Tolerate a BOM in case the file was edited by hand.
+            let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
+            serde_json::from_str::<Settings>(text).map_err(|err| err.to_string())
+        });
+        Ok(match parsed {
             Ok(mut settings) => {
                 settings.sanitize();
                 settings
@@ -196,7 +212,7 @@ impl Settings {
                 let _ = std::fs::copy(path, &backup);
                 Self::default()
             }
-        }
+        })
     }
 
     /// Applies `change` to the settings file as it is on disk now and saves it.
@@ -208,7 +224,14 @@ impl Settings {
         let path = paths::settings_file();
         // Windows closing together must not read and write the file over each other.
         let _lock = SettingsLock::acquire();
-        let mut on_disk = Self::load_from(&path);
+        let mut on_disk = match Self::read(&path) {
+            Ok(settings) => settings,
+            Err(err) => {
+                // Writing defaults plus this change would wipe everything else.
+                log::error!("settings not saved, {} cannot be read now: {err}", path.display());
+                return;
+            }
+        };
         change(&mut on_disk);
         if let Err(err) = on_disk.save_to(&path) {
             log::error!("failed to save settings: {err}");
@@ -284,6 +307,18 @@ mod tests {
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.temp_dir, Some(PathBuf::from("D:\\temp")));
         assert_eq!(loaded.placement, None);
+
+        // No file: the defaults, and nothing to keep a copy of.
+        assert_eq!(Settings::read(&dir.join("없음.json")).unwrap(), Settings::default());
+        // Not UTF-8 (saved as UTF-16 by hand): defaults, and a copy is kept.
+        let utf16: Vec<u8> = "\u{FEFF}{\"dark_mode\": true}".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        std::fs::write(&path, &utf16).unwrap();
+        assert_eq!(Settings::read(&path).unwrap(), Settings::default());
+        assert_eq!(std::fs::read(path.with_extension("json.bad")).unwrap(), utf16);
+        // There but unreadable now (here: a folder): an error, so that the caller
+        // does not write defaults over it.
+        assert!(Settings::read(&dir).is_err());
+        assert_eq!(Settings::load_from(&dir), Settings::default());
         let _ = std::fs::remove_dir_all(dir);
     }
 

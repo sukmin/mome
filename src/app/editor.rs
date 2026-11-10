@@ -18,6 +18,9 @@ use crate::theme::SyntaxColors;
 pub const ZOOM_MIN: u32 = 10;
 pub const ZOOM_MAX: u32 = 500;
 pub const ZOOM_STEP: u32 = 10;
+/// Natural logarithm of the zoom factor egui makes of one notch of Ctrl+wheel
+/// (40 points for a line of scrolling × 1/200 per point).
+const WHEEL_NOTCH: f32 = 0.2;
 const TEXT_MARGIN: Margin = Margin {
     left: 10,
     right: 10,
@@ -32,6 +35,8 @@ pub struct Editor {
     /// An IME composition (e.g. a Hangul syllable being assembled) is in progress.
     composing: bool,
     pub zoom: u32,
+    /// Zoom from the wheel that has not added up to a step yet (natural logarithm).
+    zoom_carry: f32,
     pending_events: Vec<Event>,
     pending_focus: bool,
     pending_select: Option<(usize, usize)>,
@@ -85,6 +90,7 @@ impl Editor {
             overwrite: false,
             composing: false,
             zoom: 100,
+            zoom_carry: 0.0,
             pending_events: Vec::new(),
             pending_focus: true,
             pending_select: None,
@@ -175,6 +181,22 @@ impl Editor {
     pub fn zoom_by(&mut self, steps: i32) {
         let z = self.zoom as i32 + steps * ZOOM_STEP as i32;
         self.zoom = z.clamp(ZOOM_MIN as i32, ZOOM_MAX as i32) as u32;
+    }
+
+    /// Zooms by what Ctrl+wheel (or a pinch) did this frame: one step per notch of
+    /// the wheel. egui hands a notch out over about ten frames, each with a part of
+    /// its factor, so the parts are added up rather than each taken for a step.
+    pub fn zoom_by_factor(&mut self, factor: f32) {
+        if factor == 1.0 || !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        self.zoom_carry += factor.ln();
+        // Rounded, so the step comes as soon as most of a notch has arrived.
+        let steps = (self.zoom_carry / WHEEL_NOTCH).round();
+        if steps != 0.0 {
+            self.zoom_carry -= steps * WHEEL_NOTCH;
+            self.zoom_by(steps as i32);
+        }
     }
 
     /// Replaces the whole text as one undoable step and selects `selection` afterwards.
@@ -299,7 +321,7 @@ impl Editor {
         } else {
             self.last_selection
         };
-        let output = scroll
+        let mut area = scroll
             .id_salt("mome-editor-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -342,8 +364,24 @@ impl Editor {
                     }
                 }
                 out
-            })
-            .inner;
+            });
+        if ctx.dragged_id() == Some(id) {
+            // egui's scroll areas ignore the wheel while anything is dragged, but a
+            // selection being dragged must be able to go on past what is in view. The
+            // text under the pointer then changes, and the selection follows next frame.
+            let mut delta = ctx.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta));
+            if wrap {
+                delta.x = 0.0;
+            }
+            let furthest = (area.content_size - area.inner_rect.size()).max(Vec2::ZERO);
+            let offset = (area.state.offset - delta).clamp(Vec2::ZERO, furthest);
+            if offset != area.state.offset {
+                area.state.offset = offset;
+                area.state.store(&ctx, area.id);
+                ctx.request_repaint();
+            }
+        }
+        let output = area.inner;
 
         let response = output.response.response;
         let right_click = response.hovered()
@@ -698,6 +736,143 @@ mod tests {
             let found: Vec<Match> = cuts.as_chunks::<2>().0.iter().map(|&[a, b]| match_at(a..b)).collect();
             let job = layout_job(text, &options(Some(SYNTAX), &found), 100.0);
             assert_eq!(job.text, text, "{found:?}");
+        }
+    }
+
+    /// Runs one frame of a 400×300 window that shows only the text area, without a
+    /// real window or real input. Returns where the text is on screen.
+    fn frame(ctx: &Context, editor: &mut Editor, text: &mut String, wrap: bool, events: Vec<Event>) -> egui::Rect {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0))),
+            time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+            events,
+            ..Default::default()
+        };
+        let opts = ShowOptions {
+            wrap,
+            ..options(None, &[])
+        };
+        let mut rect = egui::Rect::NOTHING;
+        ctx.run_ui(input, |ui| rect = editor.show(ui, text, &opts).response.rect)
+            .drop_without_applying_deltas();
+        rect
+    }
+
+    /// The same once the wheel has been turned by `delta` and its smoothing has run out.
+    fn after_wheel(ctx: &Context, editor: &mut Editor, text: &mut String, wrap: bool, delta: Vec2) -> egui::Rect {
+        frame(ctx, editor, text, wrap, vec![wheel(delta)]);
+        for _ in 0..60 {
+            frame(ctx, editor, text, wrap, vec![]);
+        }
+        frame(ctx, editor, text, wrap, vec![])
+    }
+
+    fn wheel(delta: Vec2) -> Event {
+        Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Presses the mouse button in the text and drags far enough to be selecting.
+    fn start_drag(ctx: &Context, editor: &mut Editor, text: &mut String, wrap: bool) {
+        let press = Pos2::new(100.0, 50.0);
+        frame(ctx, editor, text, wrap, vec![]);
+        frame(ctx, editor, text, wrap, vec![Event::PointerMoved(press)]);
+        let pressed = Event::PointerButton {
+            pos: press,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(ctx, editor, text, wrap, vec![pressed]);
+        frame(ctx, editor, text, wrap, vec![Event::PointerMoved(Pos2::new(100.0, 120.0))]);
+        frame(ctx, editor, text, wrap, vec![]);
+        assert_eq!(ctx.dragged_id(), Some(editor.id));
+    }
+
+    /// Turns the wheel by `notches` with Ctrl held and runs the frames egui spreads it over.
+    fn ctrl_wheel(ctx: &Context, editor: &mut Editor, notches: f32) {
+        for n in 0..40 {
+            let events = if n == 0 {
+                vec![Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: Vec2::new(0.0, notches),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::CTRL,
+                }]
+            } else {
+                vec![]
+            };
+            let input = egui::RawInput {
+                time: Some(ctx.input(|i| i.time) + 1.0 / 60.0),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| editor.zoom_by_factor(ui.input(|i| i.zoom_delta())))
+                .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn a_notch_of_ctrl_wheel_is_one_zoom_step() {
+        let ctx = Context::default();
+        let mut editor = Editor::new();
+        ctrl_wheel(&ctx, &mut editor, 1.0);
+        assert_eq!(editor.zoom, 110);
+        ctrl_wheel(&ctx, &mut editor, 1.0);
+        assert_eq!(editor.zoom, 120);
+        ctrl_wheel(&ctx, &mut editor, -3.0);
+        assert_eq!(editor.zoom, 90);
+        for _ in 0..20 {
+            ctrl_wheel(&ctx, &mut editor, -1.0);
+        }
+        assert_eq!(editor.zoom, ZOOM_MIN);
+        ctrl_wheel(&ctx, &mut editor, 1.0);
+        assert_eq!(editor.zoom, ZOOM_MIN + ZOOM_STEP);
+        // No factor, or nonsense, changes nothing.
+        for factor in [1.0, 0.0, -2.0, f32::NAN, f32::INFINITY] {
+            editor.zoom_by_factor(factor);
+        }
+        assert_eq!(editor.zoom, ZOOM_MIN + ZOOM_STEP);
+    }
+
+    #[test]
+    fn wheel_scrolls_while_dragging_a_selection() {
+        let ctx = Context::default();
+        let mut editor = Editor::new();
+        let mut text: String = (1..=300).map(|n| format!("줄 {n}\n")).collect();
+        start_drag(&ctx, &mut editor, &mut text, true);
+        let top = frame(&ctx, &mut editor, &mut text, true, vec![]).top();
+        let (anchor, end) = editor.stored_selection(&ctx).unwrap();
+        assert!(end > anchor);
+
+        // Down: the text moves up, and the selection grows to what is now under the pointer.
+        let down = after_wheel(&ctx, &mut editor, &mut text, true, Vec2::new(0.0, -200.0)).top();
+        assert!(down < top - 150.0, "{top} -> {down}");
+        let (anchor_down, end_down) = editor.stored_selection(&ctx).unwrap();
+        assert_eq!(anchor_down, anchor);
+        assert!(end_down > end, "{end} -> {end_down}");
+
+        // And back up, but never past the start.
+        let up = after_wheel(&ctx, &mut editor, &mut text, true, Vec2::new(0.0, 5000.0)).top();
+        assert_eq!(up, top);
+        assert_eq!(editor.stored_selection(&ctx).unwrap(), (anchor, end));
+    }
+
+    #[test]
+    fn wheel_scrolls_sideways_while_dragging_only_without_wrapping() {
+        let long_lines: String = (1..=300).map(|n| format!("{n} {}\n", "가나다라 ".repeat(60))).collect();
+        for (wrap, moves) in [(false, true), (true, false)] {
+            let ctx = Context::default();
+            let mut editor = Editor::new();
+            let mut text = long_lines.clone();
+            start_drag(&ctx, &mut editor, &mut text, wrap);
+            let before = frame(&ctx, &mut editor, &mut text, wrap, vec![]).left();
+            let after = after_wheel(&ctx, &mut editor, &mut text, wrap, Vec2::new(-200.0, 0.0)).left();
+            assert_eq!(after < before - 150.0, moves, "wrap {wrap}: {before} -> {after}");
         }
     }
 
