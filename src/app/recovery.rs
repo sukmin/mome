@@ -29,7 +29,7 @@ impl MomeApp {
         let from_revision = record.revision.clone().filter(|_| doc.autosave_blocked);
         let restored = !record.modified || from_revision.is_some();
         self.set_document(ctx, doc, record.cursor);
-        if let Some(revision) = from_revision {
+        if let Some(revision) = from_revision.map(|revision| self.session.adopt_text(revision)) {
             // Until the next revision is written, the one the text came from is the
             // way back to it should this window go down again first; a record
             // without one would be thrown away as having nothing to recover.

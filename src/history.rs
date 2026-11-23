@@ -45,10 +45,12 @@ pub enum RevisionKind {
     Close,
     /// Windows was shutting down.
     Session,
+    /// 업데이트를 설치한 뒤 새 버전으로 다시 시작했다.
+    Restart,
 }
 
 impl RevisionKind {
-    const ALL: [RevisionKind; 7] = [
+    const ALL: [RevisionKind; 8] = [
         RevisionKind::Auto,
         RevisionKind::Manual,
         RevisionKind::Save,
@@ -56,6 +58,7 @@ impl RevisionKind {
         RevisionKind::Reload,
         RevisionKind::Close,
         RevisionKind::Session,
+        RevisionKind::Restart,
     ];
 
     fn tag(self) -> &'static str {
@@ -67,6 +70,7 @@ impl RevisionKind {
             RevisionKind::Reload => "reload",
             RevisionKind::Close => "close",
             RevisionKind::Session => "session",
+            RevisionKind::Restart => "restart",
         }
     }
 
@@ -79,6 +83,7 @@ impl RevisionKind {
             RevisionKind::Reload => "다시 불러오기 전",
             RevisionKind::Close => "저장 안 함",
             RevisionKind::Session => "Windows 종료",
+            RevisionKind::Restart => "업데이트 다시 시작",
         }
     }
 }

@@ -33,7 +33,7 @@ use crate::win;
 use crate::APP_NAME;
 
 pub use commands::Cmd;
-use dialogs::{Dialog, SettingsForm};
+use dialogs::{Dialog, SettingsForm, Updater};
 use editor::Editor;
 use findbar::FindBar;
 use invisible_bar::InvisibleState;
@@ -51,12 +51,13 @@ pub struct Launch {
     pub revision: Option<PathBuf>,
     /// Where the window was last time (or before Windows restarted).
     pub placement: Option<WindowPlacement>,
+    /// 업데이트 뒤 "다시 시작"으로 떴으면 앞선 창의 버전.
+    pub updated_from: Option<String>,
 }
 
 /// What to do once the user has dealt with unsaved changes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum After {
-    New,
     Open(Option<PathBuf>),
     Reopen(Encoding),
     Exit,
@@ -128,6 +129,8 @@ pub struct MomeApp {
     /// The shutdown hook's copy of the text is behind (copies are throttled for big documents).
     session_text_stale: bool,
     session_text_at: Instant,
+    /// [도움말 > mome 업데이트]의 상태.
+    updater: Updater,
 }
 
 impl MomeApp {
@@ -187,6 +190,7 @@ impl MomeApp {
             text_version: 0,
             session_text_stale: false,
             session_text_at: Instant::now(),
+            updater: Updater::default(),
         };
         app.find.options = app.settings.find.clone();
         // Our loader goes last so it is asked first for `file:` pictures.
@@ -200,7 +204,11 @@ impl MomeApp {
         let restoring = launch.restore.is_some();
         if let Some(record) = launch.restore {
             log::info!("restoring session {}", record.sid);
-            self.restore_record(ctx, &record);
+            // 업데이트 뒤 "다시 시작"으로 떴으면 앞선 창이 기다리고 있다: 문서를 넘겨받았으니 닫아도 된다고 알린다.
+            // 저장하지 않은 글을 읽지 못했으면 알리지 않는다: 그 글은 앞선 창에만 있다(앞선 창은 기다리다 그만둔다).
+            if self.restore_record(ctx, &record) {
+                crate::update::signal_restored(&record.sid);
+            }
             // The record now belongs to this window (same id); it is rewritten below.
         } else if let Some(path) = launch.revision {
             match doc_from_revision(&path) {
@@ -219,6 +227,13 @@ impl MomeApp {
         if !restoring {
             self.offer_recovery();
         }
+        if let Some(from) = launch.updated_from.filter(|from| from != crate::APP_VERSION) {
+            log::info!("restarted after an update from {from}");
+            // 복원하며 띄운 경고(저장하지 않은 내용을 찾지 못함 등)는 가리지 않는다.
+            if !self.message.as_ref().is_some_and(|m| m.warning) {
+                self.notify(format!("mome를 {from}에서 {}(으)로 업데이트했습니다.", crate::APP_VERSION));
+            }
+        }
         self.session.write_record();
         #[cfg(debug_assertions)]
         self.start_tests();
@@ -230,6 +245,8 @@ impl MomeApp {
     fn start_tests(&mut self) {
         // MOME_TEST_CMDS=History,Font runs those commands at start-up.
         if let Ok(script) = std::env::var("MOME_TEST_CMDS") {
+            // 이 창이 띄우는 창(새로 만들기, 다시 시작)이 물려받아 같은 명령을 끝없이 되풀이하지 않게 지운다.
+            std::env::remove_var("MOME_TEST_CMDS");
             for name in script.split(',').map(str::trim) {
                 let cmd = match name {
                     "History" => Cmd::History,
@@ -241,6 +258,10 @@ impl MomeApp {
                     "GoTo" => Cmd::GoTo,
                     "Shortcuts" => Cmd::Shortcuts,
                     "About" => Cmd::About,
+                    "New" => Cmd::New,
+                    "Update" => Cmd::Update,
+                    "UpdateCheck" => Cmd::TestUpdateCheck,
+                    "UpdateRestart" => Cmd::TestUpdateRestart,
                     "ToggleDark" => Cmd::ToggleDark,
                     "FormatJson" => Cmd::FormatJson,
                     "FindInvisible" => Cmd::FindInvisible,
@@ -546,7 +567,6 @@ impl MomeApp {
     /// The unsaved changes are handled; carry on.
     fn continue_after(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>, after: After) {
         match after {
-            After::New => self.set_document(ctx, Document::new_untitled(), 0),
             After::Open(Some(path)) => {
                 self.open_path(ctx, &path, None);
             }
@@ -852,6 +872,12 @@ impl MomeApp {
         if !ctx.input(|i| i.viewport().close_requested()) || self.allow_close {
             return;
         }
+        if self.updater.is_restarting() {
+            // 새 버전의 창이 이 문서를 넘겨받는 중이다. 지금 닫으면 세션 기록이 지워져 새 창이 빈 문서로 뜨고,
+            // 저장 여부를 묻는 창으로 바꾸면 그 뒤에 고친 내용은 새 창으로 넘어가지 않는다. 새 창이 뜨면 닫힌다.
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            return;
+        }
         if self.doc.is_modified() {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if !matches!(self.dialog, Some(Dialog::SavePrompt { .. })) {
@@ -993,6 +1019,7 @@ impl eframe::App for MomeApp {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_history();
+        self.poll_update(ctx);
         self.handle_close_request(ctx);
         // Minimized or hidden windows get logic-only passes whose input is replayed
         // later; only time-based work is safe then.
@@ -1049,6 +1076,8 @@ impl eframe::App for MomeApp {
         self.snapshot_sync(RevisionKind::Close);
         self.save_settings_on_exit();
         self.session.end_normally();
+        // 업데이트가 실행 파일을 바꾸는 중이면 끝날 때까지 기다린다.
+        crate::update::finish_before_exit();
         // Let queued revisions reach the disk before the process ends.
         if let Some(writer) = self.history.take() {
             writer.finish();

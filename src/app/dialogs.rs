@@ -6,6 +6,7 @@
 //! does what the user chose.
 
 mod history_browser;
+mod updater;
 
 use std::path::PathBuf;
 
@@ -15,6 +16,7 @@ use egui::{
 };
 
 pub use history_browser::HistoryBrowser;
+pub use updater::Updater;
 
 use super::commands::SHORTCUT_HELP;
 use super::{After, MomeApp};
@@ -44,6 +46,8 @@ pub enum Dialog {
     LossySave { path: PathBuf, after: Option<After> },
     Shortcuts,
     About,
+    /// 상태는 [`Updater`]에 있다(대화상자를 닫아도 설치는 계속된다).
+    Update,
 }
 
 pub struct GoToForm {
@@ -151,6 +155,11 @@ enum Outcome {
     Discard,
     SaveAsUtf8,
     SaveLossy,
+    UpdateCheck,
+    UpdateInstall,
+    UpdateRestart,
+    /// 웹 주소를 기본 브라우저로 연다.
+    OpenUrl(String),
 }
 
 /// The dialog's answer: the button the user chose, `on_dismiss` if they pressed Esc
@@ -236,6 +245,7 @@ impl MomeApp {
             Dialog::LossySave { .. } => self.lossy_save_ui(ctx),
             Dialog::Shortcuts => self.shortcuts_ui(ctx),
             Dialog::About => self.about_ui(ctx),
+            Dialog::Update => self.update_ui(ctx),
         };
         self.finish_dialog(ctx, frame, dialog, outcome);
     }
@@ -715,6 +725,22 @@ impl MomeApp {
                     self.doc.encoding = Encoding::Utf8;
                     self.save_to_confirmed(ctx, &path, after, lossy_ok);
                 }
+            }
+            Outcome::UpdateCheck => {
+                self.dialog = Some(dialog);
+                self.start_update_check(ctx);
+            }
+            Outcome::UpdateInstall => {
+                self.dialog = Some(dialog);
+                self.start_update_install(ctx);
+            }
+            Outcome::UpdateRestart => {
+                self.dialog = Some(dialog);
+                self.restart_for_update(ctx);
+            }
+            Outcome::OpenUrl(url) => {
+                win::open_url(&url);
+                self.dialog = Some(dialog);
             }
             Outcome::SaveLossy => {
                 if let Dialog::LossySave { path, after } = dialog {

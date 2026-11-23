@@ -4,9 +4,11 @@
 use std::path::Path;
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows_sys::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass, ShellExecuteW, SUBCLASSPROC};
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SW_SHOWNORMAL,
+};
 
 /// Null-terminated UTF-16.
 pub fn wide(s: &str) -> Vec<u16> {
@@ -80,6 +82,15 @@ pub fn open_file(path: &Path) {
     shell_execute("open", &shell_path(path, false));
 }
 
+/// 웹 주소를 기본 브라우저로 연다. `https://`로 시작하는 주소만 연다(셸은 다른 글이면 프로그램도 실행한다).
+pub fn open_url(url: &str) {
+    if url.starts_with("https://") && !url.contains(char::is_whitespace) {
+        shell_execute("open", &wide(url));
+    } else {
+        log::warn!("not opening {url:?}: not an https address");
+    }
+}
+
 fn shell_execute(verb: &str, target: &[u16]) {
     let verb = wide(verb);
     unsafe {
@@ -104,6 +115,35 @@ pub fn show_in_folder(path: &Path) {
     if let Err(err) = std::process::Command::new("explorer.exe").raw_arg(arg).spawn() {
         log::error!("could not start Explorer: {err}");
     }
+}
+
+/// 프로세스 `pid`의 본창이 화면에 보이는지(새로 띄운 mome의 창이 떴는지 알아본다).
+/// 창 라이브러리가 본창보다 먼저 띄우는 작은 보조 창(22×22 픽셀쯤)은 세지 않는다.
+pub fn has_main_window(pid: u32) -> bool {
+    /// 본창으로 볼 가장 작은 크기(픽셀). mome 창은 이보다 작아지지 않는다.
+    const MIN_SIZE: (i32, i32) = (200, 100);
+    struct Find {
+        pid: u32,
+        found: bool,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, data: LPARAM) -> i32 {
+        // SAFETY: `data`는 아래 `EnumWindows`에 넘긴 `Find`이고, 그 호출이 끝날 때까지 살아 있다.
+        let find = unsafe { &mut *(data as *mut Find) };
+        let mut owner = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut owner) };
+        if owner == find.pid && unsafe { IsWindowVisible(hwnd) } != 0 {
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            unsafe { GetWindowRect(hwnd, &mut rect) };
+            if rect.right - rect.left >= MIN_SIZE.0 && rect.bottom - rect.top >= MIN_SIZE.1 {
+                find.found = true;
+                return 0; // 찾았다: 그만 돈다.
+            }
+        }
+        1
+    }
+    let mut find = Find { pid, found: false };
+    unsafe { EnumWindows(Some(each), &mut find as *mut Find as LPARAM) };
+    find.found
 }
 
 /// Starts another mome window.

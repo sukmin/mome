@@ -1,6 +1,6 @@
 [package]
 name = "mome"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "mome - a lightweight text editor for Windows 11"
 build = "build.rs"
@@ -22,6 +22,9 @@ egui_extras = { version = "0.36.2", features = ["image"] }
 # Without "variable-lookbehinds": like Java, a look-behind has a fixed length, and
 # `(?<=x.*)` cannot freeze the window.
 fancy-regex = { version = "0.20.0", default-features = false, features = ["std", "unicode", "perf"] }
+# 업데이트(도움말 > mome 업데이트): GitHub 릴리즈를 읽고 묶음을 내려받아 확인값(SHA-256)을 견준다.
+ureq = { version = "2", default-features = false, features = ["tls"] }
+sha2 = "0.10"
 
 [dependencies.windows-sys]
 version = "0.61"

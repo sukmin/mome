@@ -184,6 +184,48 @@ impl Session {
         self.last_written = json;
     }
 
+    /// 다른 세션의 기록 옆에 있던 글(`sessions\<다른 sid>.txt`, 임시 저장 폴더가 없을 때 쓰는 자리)을 이 세션의
+    /// 것으로 복사하고 그 경로를 돌려준다. 그 파일은 원래 세션의 기록과 함께 지워지므로(앞선 창이 닫힐 때,
+    /// 복구를 마쳤을 때), 가리키고만 있으면 이 창이 다시 내려갔을 때 되찾을 글이 없다.
+    /// 그 자리의 파일이 아니거나 복사하지 못하면 받은 경로를 그대로 돌려준다.
+    pub fn adopt_text(&self, revision: PathBuf) -> PathBuf {
+        let own = fallback_text_path(&self.sid);
+        let beside_record = revision.parent() == Some(paths::sessions_dir().as_path());
+        if !beside_record || revision == own {
+            return revision;
+        }
+        match std::fs::copy(&revision, &own) {
+            Ok(_) => own,
+            Err(err) => {
+                log::warn!("could not take over the text of another session: {err}");
+                revision
+            }
+        }
+    }
+
+    /// 업데이트 뒤 "다시 시작"을 위해 지금 상태를 기록에 남긴다: 저장하지 않은 글은 버전으로 쓰고,
+    /// 새 프로세스가 `--restore <sid>`로 읽을 기록을 디스크에 적는다. 글을 새로 썼으면 그 파일을 돌려준다.
+    /// 저장하지 않은 글을 쓰지 못했으면 오류(그대로 다시 시작하면 그 글을 잃는다).
+    pub fn save_for_restart(&mut self) -> std::io::Result<Option<PathBuf>> {
+        let sid = self.sid.clone();
+        let mut written = None;
+        let record = self.update(|s| -> std::io::Result<SessionRecord> {
+            if !s.record.modified {
+                s.record.revision = None;
+            } else if s.revision_hash != Some(s.text_hash) || !s.record.revision.as_ref().is_some_and(|p| p.exists()) {
+                let path = save_text_for_restore(s, &sid, RevisionKind::Restart)?;
+                s.record.revision = Some(path.clone());
+                s.revision_hash = Some(s.text_hash);
+                written = Some(path);
+            }
+            Ok(s.record.clone())
+        })?;
+        let json = serde_json::to_string_pretty(&record).map_err(std::io::Error::other)?;
+        write_json(&self.sid, &json)?;
+        self.last_written = json;
+        Ok(written)
+    }
+
     /// The window was closed by the user: nothing needs restoring.
     pub fn end_normally(&mut self) {
         delete_record(&self.sid);
@@ -378,7 +420,7 @@ fn prepare_for_shutdown(hwnd: HWND, data: &HookData) {
                 s.record.revision = None;
             } else if s.revision_hash != Some(s.text_hash) || !s.record.revision.as_ref().is_some_and(|p| p.exists()) {
                 // (Also when the revision file has gone missing since it was written.)
-                match save_text_for_restore(&s, sid) {
+                match save_text_for_restore(&s, sid, RevisionKind::Session) {
                     Ok(path) => {
                         s.record.revision = Some(path);
                         s.revision_hash = Some(s.text_hash);
@@ -399,19 +441,19 @@ fn prepare_for_shutdown(hwnd: HWND, data: &HookData) {
 /// Writes the unsaved text as a revision, or next to the session record when no
 /// temp folder has been chosen yet or it cannot be written to now (a drive that
 /// was unplugged or is full).
-fn save_text_for_restore(s: &Shared, sid: &str) -> std::io::Result<PathBuf> {
+fn save_text_for_restore(s: &Shared, sid: &str, kind: RevisionKind) -> std::io::Result<PathBuf> {
     if let Some(root) = s.history_root.clone() {
         let written = history::write_snapshot(&SnapshotJob {
             root,
             key: s.record.doc_key.clone(),
             info: s.doc_info.clone(),
-            kind: RevisionKind::Session,
+            kind,
             time: LocalTime::now(),
             text: s.text.clone(),
         });
         match written {
             Ok(path) => return Ok(path),
-            Err(err) => log::warn!("could not write a revision at shutdown ({err}); keeping the text with the session"),
+            Err(err) => log::warn!("could not write a revision for the restore ({err}); keeping the text with the session"),
         }
     }
     let path = fallback_text_path(sid);

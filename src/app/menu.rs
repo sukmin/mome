@@ -69,7 +69,6 @@ impl MomeApp {
     fn file_menu(&mut self, ui: &mut Ui) {
         ui.set_min_width(MENU_WIDTH);
         self.item(ui, "새로 만들기", Cmd::New, true);
-        self.item(ui, "새 창", Cmd::NewWindow, true);
         self.item(ui, "열기…", Cmd::Open, true);
         let recent = self.settings.recent_files.clone();
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
@@ -227,6 +226,7 @@ impl MomeApp {
     fn help_menu(&mut self, ui: &mut Ui) {
         ui.set_min_width(MENU_WIDTH);
         self.item(ui, "단축키", Cmd::Shortcuts, true);
+        self.item(ui, "mome 업데이트…", Cmd::Update, true);
         self.item(ui, "mome 정보", Cmd::About, true);
     }
 

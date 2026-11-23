@@ -10,6 +10,7 @@ use super::viewer::ViewKind;
 use super::{After, MomeApp};
 use crate::encoding::{Encoding, LineEnding};
 use crate::history::RevisionKind;
+use crate::placement;
 use crate::print::{self, PrintJob, PrintOutcome};
 use crate::theme;
 use crate::win;
@@ -17,8 +18,8 @@ use crate::win;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
     // 파일
+    /// 새 문서를 새 창에서 연다(이 창은 그대로 둔다).
     New,
-    NewWindow,
     Open,
     /// Open dialog without asking about unsaved changes (already asked).
     OpenUnchecked,
@@ -67,7 +68,14 @@ pub enum Cmd {
     Reopen(Encoding),
     // 도움말
     Shortcuts,
+    Update,
     About,
+    /// 디버그 빌드의 시험용(`MOME_TEST_CMDS`): 업데이트 창을 열고 바로 확인한다.
+    #[cfg(debug_assertions)]
+    TestUpdateCheck,
+    /// 디버그 빌드의 시험용: 업데이트를 설치한 뒤처럼 다시 시작한다.
+    #[cfg(debug_assertions)]
+    TestUpdateRestart,
 }
 
 const CMD: Modifiers = Modifiers::COMMAND;
@@ -76,7 +84,8 @@ const CMD_SHIFT: Modifiers = Modifiers::COMMAND.plus(Modifiers::SHIFT);
 /// Keyboard shortcuts. More specific modifiers must come first: egui ignores
 /// extra Shift/Alt when matching.
 const SHORTCUTS: &[(Modifiers, Key, Cmd)] = &[
-    (CMD_SHIFT, Key::N, Cmd::NewWindow),
+    // 새로 만들기는 새 창을 연다. 예전의 [새 창] 단축키도 같은 일을 한다.
+    (CMD_SHIFT, Key::N, Cmd::New),
     (CMD, Key::N, Cmd::New),
     (CMD, Key::O, Cmd::Open),
     (CMD_SHIFT, Key::S, Cmd::SaveAs),
@@ -102,8 +111,7 @@ const SHORTCUTS: &[(Modifiers, Key, Cmd)] = &[
 
 /// The table in 도움말 > 단축키 (F1).
 pub(super) const SHORTCUT_HELP: &[(&str, &str)] = &[
-    ("Ctrl+N", "새로 만들기"),
-    ("Ctrl+Shift+N", "새 창"),
+    ("Ctrl+N", "새로 만들기 (새 창에서 열림, Ctrl+Shift+N도 같음)"),
     ("Ctrl+O", "열기"),
     ("Ctrl+S", "저장"),
     ("Ctrl+Shift+S", "다른 이름으로 저장"),
@@ -130,7 +138,6 @@ pub(super) const SHORTCUT_HELP: &[(&str, &str)] = &[
 pub fn shortcut_text(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::New => "Ctrl+N",
-        Cmd::NewWindow => "Ctrl+Shift+N",
         Cmd::Open => "Ctrl+O",
         Cmd::Save => "Ctrl+S",
         Cmd::SaveAs => "Ctrl+Shift+S",
@@ -179,6 +186,8 @@ fn drop_alt_letters(ctx: &egui::Context) {
 
 impl MomeApp {
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // 새로 만들기는 창(프로세스)을 하나 띄운다. Ctrl+N을 누르고 있어도 키 반복마다 띄우지 않는다.
+        ctx.input_mut(|i| i.events.retain(|event| !is_repeated_new(event)));
         for (modifiers, key, cmd) in SHORTCUTS {
             if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(*modifiers, *key))) {
                 self.pending_cmds.push(cmd.clone());
@@ -243,8 +252,7 @@ impl MomeApp {
             }
         }
         match cmd {
-            Cmd::New => self.confirm_then(ctx, frame, After::New),
-            Cmd::NewWindow => win::spawn_self(&[]),
+            Cmd::New => self.new_window(),
             Cmd::Open => self.confirm_then(ctx, frame, After::Open(None)),
             Cmd::OpenUnchecked => {
                 if let Some(path) = self.pick_open_path(frame) {
@@ -383,7 +391,35 @@ impl MomeApp {
             }
 
             Cmd::Shortcuts => self.open_dialog(Dialog::Shortcuts),
+            Cmd::Update => self.open_update_dialog(),
             Cmd::About => self.open_dialog(Dialog::About),
+            #[cfg(debug_assertions)]
+            Cmd::TestUpdateCheck => {
+                self.open_update_dialog();
+                self.start_update_check(ctx);
+            }
+            #[cfg(debug_assertions)]
+            Cmd::TestUpdateRestart => {
+                self.open_update_dialog();
+                self.restart_for_update(ctx);
+            }
+        }
+    }
+
+    /// 새 문서를 새 창(새 프로세스)에서 연다. 이 창과 그 문서는 그대로 둔다.
+    /// 새 창은 이 창을 가리지 않게 조금 비켜 놓는다.
+    fn new_window(&mut self) {
+        self.track_window();
+        match self.window_placement.map(|here| placement::cascaded(self.hwnd, &here)) {
+            Some(there) => win::spawn_self(&["--placement".as_ref(), placement::to_arg(&there).as_ref()]),
+            None => win::spawn_self(&[]),
+        }
+    }
+
+    /// [도움말 > mome 업데이트]. 이미 열려 있으면(시험용 명령이 겹쳤을 때) 또 열지 않는다.
+    fn open_update_dialog(&mut self) {
+        if !matches!(self.dialog, Some(Dialog::Update)) {
+            self.open_dialog(Dialog::Update);
         }
     }
 
@@ -430,7 +466,13 @@ impl MomeApp {
     }
 }
 
+/// 누르고 있어서 되풀이된 Ctrl+N(Ctrl+Shift+N)인지.
+fn is_repeated_new(event: &Event) -> bool {
+    matches!(event, Event::Key { key: Key::N, pressed: true, repeat: true, modifiers, .. } if modifiers.command)
+}
+
 fn key_event(key: Key, modifiers: Modifiers) -> Event {
+
     Event::Key {
         key,
         physical_key: None,
@@ -443,6 +485,16 @@ fn key_event(key: Key, modifiers: Modifiers) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 누르고_있는_새로_만들기는_한_번만_친다() {
+        let n = |repeat, modifiers| Event::Key { key: Key::N, physical_key: None, pressed: true, repeat, modifiers };
+        assert!(!is_repeated_new(&n(false, CMD)));
+        assert!(is_repeated_new(&n(true, CMD)));
+        assert!(is_repeated_new(&n(true, CMD_SHIFT)));
+        // 글자 n을 누르고 있는 것은 그냥 입력이다.
+        assert!(!is_repeated_new(&n(true, Modifiers::NONE)));
+    }
 
     #[test]
     fn alt_letters_type_nothing() {
